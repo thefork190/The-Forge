@@ -138,6 +138,11 @@ set(CORE_SOURCES
 	"Private/OS/Darwin/DarwinLog.c"
 	"Private/OS/Darwin/DarwinThread.c"
 )
+set_target_properties(
+    ${PROJECT_NAME}
+    PROPERTIES
+    XCODE_ATTRIBUTE_CLANG_ENABLE_OBJC_ARC YES  
+)
 else()
 # Core functionalities
 set(CORE_SOURCES 
