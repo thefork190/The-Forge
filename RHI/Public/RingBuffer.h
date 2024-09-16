@@ -137,6 +137,11 @@ static inline void resetGPURingBuffer(GPURingBuffer* pRingBuffer) { pRingBuffer-
 
 static inline GPURingBufferOffset getGPURingBufferOffset(GPURingBuffer* pRingBuffer, uint32_t memoryRequirement, uint32_t alignment = 0)
 {
+    auto round_up = [](uint32_t value, uint32_t multiple) {
+        return ((value + multiple - 1) / multiple) * multiple;
+        };
+
+
     uint32_t alignedSize = round_up(memoryRequirement, alignment ? alignment : pRingBuffer->mBufferAlignment);
 
     if (alignedSize > pRingBuffer->mMaxBufferSize)
