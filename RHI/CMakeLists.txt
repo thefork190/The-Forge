@@ -62,6 +62,7 @@ set(public_headers
 	Public/ITime.h
 	Public/IToolFileSystem.h
 	Public/RingBuffer.h
+	Public/IFont.h
 )
 
 
@@ -96,10 +97,13 @@ set(RHI_SOURCES
 	"Private/Graphics/CommonShaderReflection.cpp"
 	"Private/Graphics/GraphicsConfig.cpp"
 	"Private/Graphics/PickRenderingApi.cpp"
-	"Private/ResourceLoader/ResourceLoader.cpp"
+	"Private/ResourceLoader/ResourceLoader.cpp"	
 	"Private/Graphics/Metal/MetalRaytracing.mm"
 	"Private/Graphics/Metal/MetalRenderer.mm"
 	"Private/Graphics/Metal/MetalShaderReflection.mm"
+
+	"Private/Fonts/FontSystem.cpp"
+	"Private/Fonts/stbtt.cpp"
 )
 
 set_source_files_properties(
@@ -122,6 +126,9 @@ set(RHI_SOURCES
 	"Private/Graphics/Vulkan/Vulkan.cpp"
 	"Private/Graphics/Vulkan/VulkanRaytracing.cpp"
 	"Private/Graphics/Vulkan/VulkanShaderReflection.cpp"
+
+	"Private/Fonts/FontSystem.cpp"
+	"Private/Fonts/stbtt.cpp"
 )
 endif()
 
