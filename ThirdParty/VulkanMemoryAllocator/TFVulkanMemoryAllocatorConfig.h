@@ -54,7 +54,7 @@
 
 // Log is very verbose, prints for each allocation
 #ifdef ENABLE_VMA_LOG
-	#define VMA_DEBUG_LOG(format, ...) LOGF(eDEBUG, "VMA: " format, __VA_ARGS__)
+	#define VMA_DEBUG_LOG(format, ...) LOGF(eDEBUG, "VMA: " format, ##__VA_ARGS__)
 #else
 	#define VMA_DEBUG_LOG(format, ...)
 #endif

@@ -6,6 +6,11 @@ project("RHI"
     DESCRIPTION "The-Forge RHI"
 )
 
+if(APPLE)
+    enable_language(OBJC)
+    enable_language(OBJCXX)
+endif()
+
 if (NOT CMAKE_PROJECT_NAME STREQUAL PROJECT_NAME)
     message(STATUS "This project has a top-level one called [${CMAKE_PROJECT_NAME}]")
 else()
@@ -46,6 +51,7 @@ set(public_headers
     Public/Config.h
 	Public/IFileSystem.h
 	Public/IGraphics.h
+	Public/Log/Log.h
 	Public/ILog.h
 	Public/IMemory.h
 	Public/IOperatingSystem.h
@@ -59,6 +65,9 @@ set(public_headers
 )
 
 
+if(APPLE)
+set(SPIRV_SOURCES )
+else()
 # Spirv Tools
 set(SPIRV_SOURCES 
 	"../ThirdParty/SPIRV_Cross/spirv_cfg.cpp"
@@ -73,6 +82,7 @@ set(SPIRV_SOURCES
 	"../ThirdParty/SPIRV_Cross/spirv_reflect.cpp"
 	"../ThirdParty/SPIRV_Cross/SpirvTools.cpp"
 )
+endif()
 
 # BString
 set(BSTRLIB_SOURCES
@@ -80,13 +90,27 @@ set(BSTRLIB_SOURCES
 	"Private/Math/StbDs.c"
 )
 
+if(APPLE)
 # RHI (min. requirement for rendering)
 set(RHI_SOURCES 
 	"Private/Graphics/CommonShaderReflection.cpp"
 	"Private/Graphics/GraphicsConfig.cpp"
 	"Private/Graphics/PickRenderingApi.cpp"
-
 	"Private/ResourceLoader/ResourceLoader.cpp"
+	"Private/Graphics/Metal/MetalRaytracing.mm"
+	"Private/Graphics/Metal/MetalRenderer.mm"
+	"Private/Graphics/Metal/MetalShaderReflection.mm"
+)
+
+set_source_files_properties(
+    ${RHI_SOURCES} PROPERTIES LANGUAGE OBJCXX
+)
+else()
+# RHI (min. requirement for rendering)
+set(RHI_SOURCES 
+	"Private/Graphics/CommonShaderReflection.cpp"
+	"Private/Graphics/GraphicsConfig.cpp"
+	"Private/Graphics/PickRenderingApi.cpp"
 
 	"Private/ResourceLoader/ResourceLoader.cpp"
 	
@@ -99,20 +123,39 @@ set(RHI_SOURCES
 	"Private/Graphics/Vulkan/VulkanRaytracing.cpp"
 	"Private/Graphics/Vulkan/VulkanShaderReflection.cpp"
 )
+endif()
 
+if(APPLE)
 # Core functionalities
 set(CORE_SOURCES 
 	"Private/Log/Log.c"
 	"Private/MemoryTracking/MemoryTracking.c"
 	"Private/FileSystem/FileSystem.c"
-
 	"Private/OS/Timer.c"
-
+	"Private/OS/Darwin/CocoaFileSystem.mm"
+	"Private/OS/Darwin/CocoaToolsFileSystem.mm"
+	"Private/FileSystem/UnixFileSystem.c"
+	"Private/OS/Darwin/DarwinLog.c"
+	"Private/OS/Darwin/DarwinThread.c"
+)
+set_target_properties(
+    ${PROJECT_NAME}
+    PROPERTIES
+    XCODE_ATTRIBUTE_CLANG_ENABLE_OBJC_ARC YES  
+)
+else()
+# Core functionalities
+set(CORE_SOURCES 
+	"Private/Log/Log.c"
+	"Private/MemoryTracking/MemoryTracking.c"
+	"Private/FileSystem/FileSystem.c"
+	"Private/OS/Timer.c"
 	"Private/OS/Windows/WindowsThread.c"
 	"Private/OS/Windows/WindowsLog.c"
 	"Private/OS/Windows/WindowsFileSystem.cpp"
 	"Private/OS/Windows/WindowsTime.c"
 )
+endif()
 
 target_sources(${PROJECT_NAME}
 	PRIVATE
@@ -123,6 +166,7 @@ target_sources(${PROJECT_NAME}
 		${BSTRLIB_SOURCES}
 )
 
+if(NOT APPLE)
 target_link_libraries(${PROJECT_NAME}
 	PRIVATE
 		${CMAKE_CURRENT_SOURCE_DIR}/../ThirdParty/DirectXShaderCompiler/lib/x64/dxcompiler.lib
@@ -130,7 +174,7 @@ target_link_libraries(${PROJECT_NAME}
 		${CMAKE_CURRENT_SOURCE_DIR}/../ThirdParty/ags/ags_lib/lib/amd_ags_x64.lib
 		${CMAKE_CURRENT_SOURCE_DIR}/../ThirdParty/winpixeventruntime/bin/WinPixEventRuntime.lib
 )
-
+endif()
 # where to find our CMake modules
 set(CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 #message(STATUS "CMake module path: ${CMAKE_MODULE_PATH}")
