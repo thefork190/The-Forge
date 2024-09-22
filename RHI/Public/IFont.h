@@ -42,7 +42,7 @@ typedef struct FontSystemDesc
 {
     Renderer* pRenderer = NULL;
     uint32_t  mFontstashRingSizeBytes = 1024 * 1024;
-    float     mDpiDesc[2] = {};
+    float     mContentScale = 1.f;
 
     PipelineCache* pCache;
     uint32_t       mColorFormat; // enum TinyImageFormat
@@ -89,7 +89,7 @@ FORGE_API void exitFontSystem();
 
 /// Handles window resizing
 /// To be called at application load time by the App Layer
-FORGE_API void resizeFontSystem(const uint32_t width, const uint32_t height);
+FORGE_API void resizeFontSystem(const uint32_t width, const uint32_t height, const float contentScale);
 
 /// Renders UI-style text to the screen using a loaded font w/ The Forge
 /// This function will assert if Font Rendering has not been initialized
