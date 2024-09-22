@@ -73,8 +73,7 @@ struct Fontstash
 
     // Render size
     float2 mScaleBias;
-    float2 mDpiScale;
-    float  mDpiScaleMin;
+    float  mContentScale;
 
     bool mRenderInitialized;
 
@@ -215,16 +214,12 @@ static void fonsImplementationRenderText(void* userPtr, const float* verts, cons
 
 void fonsImplementationRemoveTexture(void*) {}
 
-static bool platformInitFontSystem(const float dpiScaleX, const float dpiScaleY)
+static bool platformInitFontSystem(const float contentScale)
 {
-    float          dpiScale[2] = {};
-    gFontstash.mDpiScale.x = dpiScaleX;
-    gFontstash.mDpiScale.y = dpiScaleY;
+    gFontstash.mContentScale = contentScale;
 
-    gFontstash.mDpiScaleMin = min(gFontstash.mDpiScale.x, gFontstash.mDpiScale.y);
-
-    gFontstash.mWidth = gFontstash.TextureAtlasDimension * (int)ceilf(gFontstash.mDpiScale.x);
-    gFontstash.mHeight = gFontstash.TextureAtlasDimension * (int)ceilf(gFontstash.mDpiScale.y);
+    gFontstash.mWidth = gFontstash.TextureAtlasDimension * (int)ceilf(contentScale);
+    gFontstash.mHeight = gFontstash.TextureAtlasDimension * (int)ceilf(contentScale);
     gFontstash.mFontMaxSize = min(gFontstash.mWidth, gFontstash.mHeight) / 10.0f; // see fontstash.h, line 1271, for fontSize calculation
 
     // create FONS context
@@ -261,7 +256,7 @@ bool initFontSystem(FontSystemDesc* pDesc)
 {
     ASSERT(!gFontstash.mRenderInitialized);
 
-    if (!platformInitFontSystem(pDesc->mDpiDesc[0], pDesc->mDpiDesc[1]))
+    if (!platformInitFontSystem(pDesc->mContentScale))
         return false;
 
     gFontstash.pRenderer = pDesc->pRenderer;
@@ -431,9 +426,10 @@ void exitFontSystem()
     gFontstash.mRenderInitialized = false;
 }
 
-void resizeFontSystem(const uint32_t width, const uint32_t height)
+void resizeFontSystem(const uint32_t width, const uint32_t height, const float contentScale)
 {
     gFontstash.mScaleBias = { 2.0f / (float)width, -2.0f / (float)height };
+    gFontstash.mContentScale = contentScale;
 }
 
 void cmdDrawTextWithFont(Cmd* pCmd, float2 screenCoordsInPx, const FontDrawDesc* pDesc)
@@ -461,17 +457,17 @@ void cmdDrawTextWithFont(Cmd* pCmd, float2 screenCoordsInPx, const FontDrawDesc*
 
     FONScontext* fs = gFontstash.pContext;
     fs->params.userPtr = &draw; // -V506 (draw only used inside this function)
-    fonsSetSize(fs, size * gFontstash.mDpiScaleMin);
+    fonsSetSize(fs, size * gFontstash.mContentScale);
     fonsSetFont(fs, fontID);
     fonsSetColor(fs, color);
-    fonsSetSpacing(fs, spacing * gFontstash.mDpiScaleMin);
+    fonsSetSpacing(fs, spacing * gFontstash.mContentScale);
     fonsSetBlur(fs, blur);
     fonsSetAlign(fs, FONS_ALIGN_LEFT | FONS_ALIGN_TOP);
 
     // considering the retina scaling:
     // the render target is already scaled up (w/ retina) and the (x,y) position given to this function
     // is expected to be in the render target's area. Hence, we don't scale up the position again.
-    fonsDrawText(fs, x /** gFontstash.mDpiScale.x*/, y /** gFontstash.mDpiScale.y*/, message, NULL);
+    fonsDrawText(fs, x /** gFontstash.mContentScale*/, y /** gFontstash.mContentScale*/, message, NULL);
 }
 
 void cmdDrawWorldSpaceTextWithFont(Cmd* pCmd, const mat4* pMatWorld, const mat4* pMatProjView, const FontDrawDesc* pDesc)
@@ -504,10 +500,10 @@ void cmdDrawWorldSpaceTextWithFont(Cmd* pCmd, const mat4* pMatWorld, const mat4*
 
     FONScontext* fs = gFontstash.pContext;
     fs->params.userPtr = &draw; // -V506 (draw only used inside this function)
-    fonsSetSize(fs, size * gFontstash.mDpiScaleMin);
+    fonsSetSize(fs, size * gFontstash.mContentScale);
     fonsSetFont(fs, fontID);
     fonsSetColor(fs, color);
-    fonsSetSpacing(fs, spacing * gFontstash.mDpiScaleMin);
+    fonsSetSpacing(fs, spacing * gFontstash.mContentScale);
     fonsSetBlur(fs, blur);
     fonsSetAlign(fs, FONS_ALIGN_CENTER | FONS_ALIGN_MIDDLE);
     fonsDrawText(fs, 0.0f, 0.0f, message, NULL);
@@ -627,17 +623,17 @@ float2 fntMeasureFontText(const char* pText, const FontDrawDesc* pDrawDesc)
 
     const int    messageLength = (int)strlen(pText);
     FONScontext* fs = gFontstash.pContext;
-    fonsSetSize(fs, pDrawDesc->mFontSize * gFontstash.mDpiScaleMin);
+    fonsSetSize(fs, pDrawDesc->mFontSize * gFontstash.mContentScale);
     fonsSetFont(fs, pDrawDesc->mFontID);
     fonsSetColor(fs, pDrawDesc->mFontColor);
-    fonsSetSpacing(fs, pDrawDesc->mFontSpacing * gFontstash.mDpiScaleMin);
+    fonsSetSpacing(fs, pDrawDesc->mFontSpacing * gFontstash.mContentScale);
     fonsSetBlur(fs, pDrawDesc->mFontBlur);
     fonsSetAlign(fs, FONS_ALIGN_LEFT | FONS_ALIGN_TOP);
 
     // considering the retina scaling:
     // the render target is already scaled up (w/ retina) and the (x,y) position given to this function
     // is expected to be in the render target's area. Hence, we don't scale up the position again.
-    fonsTextBounds(fs, 0.0f /** gFontstash.mDpiScale.x*/, 0.0f /** gFontstash.mDpiScale.y*/, pText, pText + messageLength, textBounds);
+    fonsTextBounds(fs, 0.0f /** gFontstash.mContentScale*/, 0.0f /** gFontstash.mContentScale*/, pText, pText + messageLength, textBounds);
 
     return float2(textBounds[2] - textBounds[0], textBounds[3] - textBounds[1]);
 }
