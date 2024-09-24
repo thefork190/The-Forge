@@ -2534,10 +2534,6 @@ typedef struct RendererDesc
 #if defined(SHADER_STATS_AVAILABLE)
     bool mEnableShaderStats;
 #endif
-
-#if defined(VULKAN) && defined(ANDROID)
-    bool mPreferVulkan;
-#endif
 } RendererDesc;
 
 typedef struct GPUVendorPreset
@@ -2764,10 +2760,6 @@ typedef struct RendererContextDesc
     bool mEnableGpuBasedValidation;
 #if defined(SHADER_STATS_AVAILABLE)
     bool mEnableShaderStats;
-#endif
-
-#if defined(VULKAN) && defined(ANDROID)
-    bool mPreferVulkan;
 #endif
 } RendererContextDesc;
 

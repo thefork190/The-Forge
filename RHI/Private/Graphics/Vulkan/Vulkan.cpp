@@ -81,7 +81,7 @@
 #endif
 
 #if defined(GFX_ENABLE_SWAPPY)
-#include "swappy/swappyVk.h"
+#include "agdk/include/swappy/swappyVk.h"
 #endif
 
 #include "IMemory.h"
@@ -4068,9 +4068,6 @@ void vk_initRenderer(const char* appName, const RendererDesc* pDesc, Renderer** 
             contextDesc.mEnableShaderStats = pDesc->mEnableShaderStats;
 #endif
 
-#if defined(ANDROID)
-            contextDesc.mPreferVulkan = pDesc->mPreferVulkan;
-#endif
             COMPILE_ASSERT(sizeof(contextDesc.mVk) == sizeof(pDesc->mVk));
             memcpy(&contextDesc.mVk, &pDesc->mVk, sizeof(pDesc->mVk));
             vk_initRendererContext(appName, &contextDesc, &pRenderer->pContext);
@@ -4887,14 +4884,9 @@ void vk_addSwapChain(Renderer* pRenderer, const SwapChainDesc* pDesc, SwapChain*
     if (gSwappyEnabled)
     {
         // Setup Swappy
-        // AndroidWindow.cpp, used to retrieve the Java activity
-        extern WindowDesc gWindow;
         uint64_t          refreshDuration;
 
-        JNIEnv* pJavaEnv = NULL;
-        gWindow.handle.activity->vm->AttachCurrentThread(&pJavaEnv, NULL);
-
-        SwappyVk_initAndGetRefreshCycleDuration(pJavaEnv, gWindow.handle.activity->clazz, pRenderer->pGpu->mVk.pGpu, pRenderer->mVk.pDevice,
+        SwappyVk_initAndGetRefreshCycleDuration(pDesc->mWindowHandle.jniEnv, gWindow.handle.activity->clazz, pRenderer->pGpu->mVk.pGpu, pRenderer->mVk.pDevice,
                                                 vkSwapchain, &refreshDuration);
         SwappyVk_setAutoSwapInterval(false);
         // Don't swap faster than the monitor refresh rate

@@ -53,7 +53,7 @@ typedef uint64_t uint64;
 
 #elif defined(__ANDROID__)
 #include <android/log.h>
-#include <android_native_app_glue.h>
+#include <android/native_window.h>
 
 #elif defined(__linux__) && !defined(VK_USE_PLATFORM_GGP)
 #define VK_USE_PLATFORM_XLIB_KHR
@@ -117,8 +117,7 @@ typedef struct WindowHandle
     HWND window;
 #elif defined(ANDROID)
     ANativeWindow* window;
-    ANativeActivity* activity;
-    AConfiguration* configuration;
+    JNIEnv* jniEnv;
 #elif defined(__APPLE__) || defined(NX64) || defined(ORBIS) || defined(PROSPERO)
     void* window;
 #elif defined(VK_USE_PLATFORM_XCB_KHR)
