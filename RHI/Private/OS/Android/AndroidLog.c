@@ -23,6 +23,7 @@
  */
 #ifdef __ANDROID__
 
+#include <android/log.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>

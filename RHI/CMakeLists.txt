@@ -177,6 +177,7 @@ elseif (ANDROID)
 			"Private/OS/Android/AndroidLog.c"
 			"Private/OS/Android/AndroidFileSystem.cpp"
 			"Private/OS/Android/AndroidTime.c"
+			"Private/FileSystem/UnixFileSystem.c"
 	)
 else ()
 # Core functionalities

@@ -1030,13 +1030,13 @@ void fsSetPathForResourceDir(IFileSystem* pIO, ResourceMount mount, ResourceDire
     strncpy(dir->mPath, resourcePath, FS_MAX_PATH);
     dir->pIO = pIO;
 
-    if (!dir->mBundled && dir->mPath[0] != 0)
+    /*if (!dir->mBundled && dir->mPath[0] != 0)
     {
         if (!fsCreateResourceDirectory(resourceDir))
         {
             LOGF(eERROR, "Could not create direcotry '%s' in filesystem", resourcePath);
         }
-    }
+    }*/
 }
 
 /************************************************************************/
