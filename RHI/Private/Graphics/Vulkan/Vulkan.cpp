@@ -4886,7 +4886,7 @@ void vk_addSwapChain(Renderer* pRenderer, const SwapChainDesc* pDesc, SwapChain*
         // Setup Swappy
         uint64_t          refreshDuration;
 
-        SwappyVk_initAndGetRefreshCycleDuration(pDesc->mWindowHandle.jniEnv, gWindow.handle.activity->clazz, pRenderer->pGpu->mVk.pGpu, pRenderer->mVk.pDevice,
+        SwappyVk_initAndGetRefreshCycleDuration(pDesc->mWindowHandle.jniEnv, pDesc->mWindowHandle.activity, pRenderer->pGpu->mVk.pGpu, pRenderer->mVk.pDevice,
                                                 vkSwapchain, &refreshDuration);
         SwappyVk_setAutoSwapInterval(false);
         // Don't swap faster than the monitor refresh rate

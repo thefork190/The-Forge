@@ -118,6 +118,7 @@ typedef struct WindowHandle
 #elif defined(ANDROID)
     ANativeWindow* window;
     JNIEnv* jniEnv;
+    jobject activity;
 #elif defined(__APPLE__) || defined(NX64) || defined(ORBIS) || defined(PROSPERO)
     void* window;
 #elif defined(VK_USE_PLATFORM_XCB_KHR)
