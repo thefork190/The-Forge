@@ -1343,7 +1343,25 @@ static VkBool32 VKAPI_PTR DebugUtilsCallback(VkDebugUtilsMessageSeverityFlagBits
     }
     else if (messageSeverity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT)
     {
-        LOGF(LogLevel::eWARNING, "[%s] : %s (%i)", pLayerPrefix, pMessage, messageCode);
+        static const char* messageDataToIgnore[] = {
+                // Weird warning on some Android devices from QC when ending a render pass
+                // Very little info online about it without and sort of lead
+                "The following warning was triggered: VKDBGUTILWARN003. Please refer to the Adreno Game Developer Guide for more information: https://developer.qualcomm.com/docs/adreno-gpu/developer-guide/index.html",
+        };
+
+        bool ignoreWarning = false;
+        for (uint32_t m = 0; m < TF_ARRAY_COUNT(messageDataToIgnore); ++m)
+        {
+            if (strstr(pMessage, messageDataToIgnore[m]))
+            {
+                ignoreWarning = true;
+                break;
+            }
+        }
+        if (!ignoreWarning)
+        {
+            LOGF(LogLevel::eWARNING, "[%s] : %s (%i)", pLayerPrefix, pMessage, messageCode);
+        }
     }
     else if (messageSeverity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT)
     {
