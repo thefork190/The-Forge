@@ -8992,7 +8992,7 @@ void vk_queuePresent(Queue* pQueue, const QueuePresentDesc* pDesc)
             ASSERT(0);
 #endif
         }
-        else if (vk_res == VK_ERROR_OUT_OF_DATE_KHR)
+        else if (vk_res == VK_ERROR_OUT_OF_DATE_KHR || vk_res == VK_ERROR_SURFACE_LOST_KHR)
         {
             // TODO : Fix bug where we get this error if window is closed before able to present queue.
         }
