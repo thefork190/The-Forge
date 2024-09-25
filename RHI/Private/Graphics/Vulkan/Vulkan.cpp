@@ -8799,6 +8799,13 @@ void vk_acquireNextImage(Renderer* pRenderer, SwapChain* pSwapChain, Semaphore* 
             return;
         }
 
+        // VK_ERROR_SURFACE_LOST_KHR can happen on Android when app is put into the background
+        if (vk_res == VK_ERROR_SURFACE_LOST_KHR)
+        {
+            pSignalSemaphore->mVk.mSignaled = true;
+            return;
+        }
+
         CHECK_VKRESULT(vk_res);
         pSignalSemaphore->mVk.mSignaled = true;
     }
