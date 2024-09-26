@@ -1200,13 +1200,15 @@ GPUPresetLevel getGPUPresetLevel(uint32_t vendorId, uint32_t modelId, const char
             GPUModelDefinition model = gGPUModels[gpuModelIndex];
             if (model.mVendorId == vendorId && model.mDeviceId == modelId && model.mDeviceId)
             {
-                presetLevel = model.mPreset;
-                break;
+                if (!strcmp(modelName, model.mModelName))
+                {
+                    presetLevel = model.mPreset;
+                    break;
+                }
             }
         }
     }
 
-#if defined(ENABLE_GRAPHICS_DEBUG)
     if (presetLevel != GPU_PRESET_NONE)
     {
         LOGF(eINFO, "Setting preset level %s for gpu vendor:%s model:%s", presetLevelToString(presetLevel), vendorName, modelName);
@@ -1217,7 +1219,6 @@ GPUPresetLevel getGPUPresetLevel(uint32_t vendorId, uint32_t modelId, const char
         LOGF(eWARNING, "Couldn't find gpu %s model: %s in gpu.data. Setting preset to %s as a default.", vendorName, modelName,
              presetLevelToString(presetLevel));
     }
-#endif
 
     return presetLevel;
 }
