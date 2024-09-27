@@ -230,7 +230,9 @@ COMPILE_ASSERT(sizeof(ssize_t) == sizeof(int64_t));
 #endif
 
 #elif defined(__ANDROID__)
+#ifndef ANDROID
 #define ANDROID
+#endif
 #elif defined(__ORBIS__)
 #define ORBIS
 #elif defined(__PROSPERO__)

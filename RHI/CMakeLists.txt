@@ -17,13 +17,14 @@ else()
     message(STATUS "This project is a top-level one")
 endif()
 
-set(CMAKE_CXX_STANDARD 11)
+set(CMAKE_CXX_STANDARD 14)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 add_library(${PROJECT_NAME} STATIC)
 
 target_include_directories(${PROJECT_NAME}
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../ThirdParty
+	PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../ThirdParty/agdk/include
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/Private
     PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/Public>
 
@@ -109,7 +110,23 @@ set(RHI_SOURCES
 set_source_files_properties(
     ${RHI_SOURCES} PROPERTIES LANGUAGE OBJCXX
 )
-else()
+elseif (ANDROID)
+# RHI (min. requirement for rendering)
+set(RHI_SOURCES
+		"Private/Graphics/CommonShaderReflection.cpp"
+		"Private/Graphics/GraphicsConfig.cpp"
+		"Private/Graphics/PickRenderingApi.cpp"
+
+		"Private/ResourceLoader/ResourceLoader.cpp"
+
+		"Private/Graphics/Vulkan/Vulkan.cpp"
+		"Private/Graphics/Vulkan/VulkanRaytracing.cpp"
+		"Private/Graphics/Vulkan/VulkanShaderReflection.cpp"
+
+		"Private/Fonts/FontSystem.cpp"
+		"Private/Fonts/stbtt.cpp"
+)
+else ()
 # RHI (min. requirement for rendering)
 set(RHI_SOURCES 
 	"Private/Graphics/CommonShaderReflection.cpp"
@@ -150,7 +167,19 @@ set_target_properties(
     PROPERTIES
     XCODE_ATTRIBUTE_CLANG_ENABLE_OBJC_ARC YES  
 )
-else()
+elseif (ANDROID)
+	set(CORE_SOURCES
+			"Private/Log/Log.c"
+			"Private/MemoryTracking/MemoryTracking.c"
+			"Private/FileSystem/FileSystem.c"
+			"Private/OS/Timer.c"
+			"Private/OS/Android/AndroidThread.c"
+			"Private/OS/Android/AndroidLog.c"
+			"Private/OS/Android/AndroidFileSystem.cpp"
+			"Private/OS/Android/AndroidTime.c"
+			"Private/FileSystem/UnixFileSystem.c"
+	)
+else ()
 # Core functionalities
 set(CORE_SOURCES 
 	"Private/Log/Log.c"

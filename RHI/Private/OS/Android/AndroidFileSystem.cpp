@@ -23,6 +23,7 @@
  */
 
 #include <android/asset_manager.h>
+#include <android/asset_manager_jni.h>
 #include <dirent.h>
 #include <errno.h>
 #include <sys/inotify.h>
@@ -41,7 +42,6 @@ extern "C"
     bool fsMergeDirAndFileName(const char* dir, const char* path, char separator, size_t dstSize, char* dst);
 }
 
-static ANativeActivity* pNativeActivity = NULL;
 static AAssetManager*   pAssetManager = NULL;
 
 static bool        gInitialized = false;
@@ -174,14 +174,13 @@ bool initFileSystem(FileSystemInitDesc* pDesc)
     for (uint32_t i = 0; i < RM_COUNT; ++i)
         gResourceMounts[i] = "";
 
-    pNativeActivity = (ANativeActivity*)pDesc->pPlatformData;
-    ASSERT(pNativeActivity);
+    pAssetManager = (AAssetManager*)pDesc->pPlatformData;
 
-    pAssetManager = pNativeActivity->assetManager;
+    // Following should be set by client
     gResourceMounts[RM_CONTENT] = "\0";
-    gResourceMounts[RM_DEBUG] = pNativeActivity->externalDataPath;
-    gResourceMounts[RM_DOCUMENTS] = pNativeActivity->internalDataPath;
-    gResourceMounts[RM_SAVE_0] = pNativeActivity->externalDataPath;
+    //gResourceMounts[RM_DEBUG] = pNativeActivity->externalDataPath;
+    //gResourceMounts[RM_DOCUMENTS] = pNativeActivity->internalDataPath;
+    //gResourceMounts[RM_SAVE_0] = pNativeActivity->externalDataPath;
     gResourceMounts[RM_SYSTEM] = "/proc/";
 
     // Override Resource mounts
