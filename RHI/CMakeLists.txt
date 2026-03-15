@@ -1,4 +1,4 @@
-﻿cmake_minimum_required (VERSION 3.15)
+cmake_minimum_required (VERSION 3.15)
 
 set(namespace "TF")
 project("RHI"
@@ -150,6 +150,21 @@ set(RHI_SOURCES
 endif()
 
 if(APPLE)
+if(IOS)
+# Core functionalities
+set(CORE_SOURCES 
+	"Private/Log/Log.c"
+	"Private/MemoryTracking/MemoryTracking.c"
+	"Private/FileSystem/FileSystem.c"
+	"Private/OS/Timer.c"
+	"Private/OS/Darwin/CocoaFileSystem.mm"
+	"Private/OS/Darwin/iOSToolsFileSystem.mm"
+	"Private/FileSystem/UnixFileSystem.c"
+	"Private/OS/Darwin/DarwinLog.c"
+	"Private/OS/Darwin/DarwinThread.c"
+)
+
+else()
 # Core functionalities
 set(CORE_SOURCES 
 	"Private/Log/Log.c"
@@ -162,6 +177,8 @@ set(CORE_SOURCES
 	"Private/OS/Darwin/DarwinLog.c"
 	"Private/OS/Darwin/DarwinThread.c"
 )
+
+endif()
 set_target_properties(
     ${PROJECT_NAME}
     PROPERTIES
