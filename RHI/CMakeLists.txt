@@ -97,7 +97,7 @@ if(APPLE)
 set(RHI_SOURCES 
 	"Private/Graphics/CommonShaderReflection.cpp"
 	"Private/Graphics/GraphicsConfig.cpp"
-	"Private/Graphics/PickRenderingApi.cpp"
+	"Private/Graphics/PickRenderingAPI.cpp"
 	"Private/ResourceLoader/ResourceLoader.cpp"	
 	"Private/Graphics/Metal/MetalRaytracing.mm"
 	"Private/Graphics/Metal/MetalRenderer.mm"
@@ -115,7 +115,7 @@ elseif (ANDROID)
 set(RHI_SOURCES
 		"Private/Graphics/CommonShaderReflection.cpp"
 		"Private/Graphics/GraphicsConfig.cpp"
-		"Private/Graphics/PickRenderingApi.cpp"
+		"Private/Graphics/PickRenderingAPI.cpp"
 
 		"Private/ResourceLoader/ResourceLoader.cpp"
 
@@ -131,7 +131,7 @@ else ()
 set(RHI_SOURCES 
 	"Private/Graphics/CommonShaderReflection.cpp"
 	"Private/Graphics/GraphicsConfig.cpp"
-	"Private/Graphics/PickRenderingApi.cpp"
+	"Private/Graphics/PickRenderingAPI.cpp"
 
 	"Private/ResourceLoader/ResourceLoader.cpp"
 	
