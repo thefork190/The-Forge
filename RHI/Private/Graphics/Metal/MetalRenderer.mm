@@ -393,7 +393,874 @@ struct UntrackedResourceData
 {
     UntrackedResourceArray mData;
     UntrackedResourceArray mRWData;
+    struct DescriptorResourceUsage* pResourceUsages;
+    uint16_t                        mResourceUsageCount;
+    uint16_t                        mResourceUsageCapacity;
 };
+
+struct DescriptorResourceUsage
+{
+    const DescriptorInfo* pDescriptor;
+    const void*           pResource;
+    uint16_t              mArrayIndex;
+    uint8_t               mReadStages;
+    uint8_t               mWriteStages;
+};
+
+struct MetalResourceAccess
+{
+    const void* pResource;
+    uint8_t     mReadStages;
+    uint8_t     mWriteStages;
+};
+
+enum MetalAccessStage : uint8_t
+{
+    METAL_ACCESS_STAGE_NONE = 0,
+    METAL_ACCESS_STAGE_VERTEX = SHADER_STAGE_VERT,
+    METAL_ACCESS_STAGE_FRAGMENT = SHADER_STAGE_FRAG,
+    METAL_ACCESS_STAGE_COMPUTE = SHADER_STAGE_COMP,
+    METAL_ACCESS_STAGE_TRANSFER = 1 << 3,
+};
+
+struct MetalRootResourceBinding
+{
+    const DescriptorInfo* pDescriptor;
+    const void*           pResource;
+    uint8_t               mUpdateFrequency;
+};
+
+struct MetalPendingBarrier
+{
+    const void*   pResource;
+    uint32_t      mHazardEdges;
+    uint32_t      mIssuedEdges;
+    uint32_t      mProducerPass;
+    uint16_t      mFenceEpoch;
+    uint8_t       mProducerReadStages;
+    uint8_t       mProducerWriteStages;
+    uint8_t       mScope;
+    bool          mClosed;
+};
+
+struct MetalFenceEpoch
+{
+    uint16_t mFenceIndices[4];
+};
+
+enum MetalTrackedFenceUpdateResult : uint8_t
+{
+    METAL_TRACKED_FENCE_NO_PRODUCER,
+    METAL_TRACKED_FENCE_EMITTED,
+    METAL_TRACKED_FENCE_UNKNOWN_PRODUCER_STAGE,
+    METAL_TRACKED_FENCE_UNSUPPORTED_PRODUCER_STAGE,
+};
+
+#if defined(ENABLE_GRAPHICS_DEBUG)
+enum MetalLegacyFenceReason : uint8_t
+{
+    METAL_LEGACY_FENCE_FORCED,
+    METAL_LEGACY_FENCE_NO_PRODUCER,
+    METAL_LEGACY_FENCE_UNKNOWN_PRODUCER_STAGE,
+    METAL_LEGACY_FENCE_UNSUPPORTED_PRODUCER_STAGE,
+    METAL_LEGACY_FENCE_REASON_COUNT,
+};
+
+struct MetalSyncDebugStats
+{
+    uint32_t mTrackedFenceUpdates[4];
+    uint32_t mTrackedFenceWaitEdges[16];
+    uint32_t mMemoryBarrierEdges[16];
+    uint32_t mLegacyFenceUpdates[METAL_LEGACY_FENCE_REASON_COUNT];
+    uint32_t mLegacyFenceWaits[4];
+    uint32_t mNoProducerBarrierSkips;
+};
+#endif
+
+struct MetalResourceTracker
+{
+    MetalResourceAccess*       pPassAccesses;
+    MetalRootResourceBinding*  pRootResources;
+    MetalPendingBarrier*       pPendingBarriers;
+    MetalFenceEpoch*           pFenceEpochs;
+    NSMutableArray<id<MTLFence>>* pFencePool;
+    id<MTLFence>               pLegacyFence;
+    Buffer*                    ppVertexBuffers[MAX_VERTEX_BINDINGS];
+    Buffer*                    pIndexBuffer;
+    uint32_t                   mPassAccessCount;
+    uint32_t                   mPassAccessCapacity;
+    uint16_t                   mRootResourceCount;
+    uint16_t                   mRootResourceCapacity;
+    uint16_t                   mPendingBarrierCount;
+    uint16_t                   mPendingBarrierCapacity;
+    uint16_t                   mFenceEpochCount;
+    uint16_t                   mFenceEpochCapacity;
+    uint16_t                   mFenceCursor;
+    uint32_t                   mBindingVersion;
+    uint32_t                   mRecordedBindingVersion;
+    uint32_t                   mVertexBufferCount;
+    uint32_t                   mPassSerial;
+    uint32_t                   mBarrierFlags;
+#if defined(ENABLE_GRAPHICS_DEBUG)
+    MetalSyncDebugStats        mDebugStats;
+    MetalSyncDebugStats        mLastLoggedDebugStats;
+    bool                       mHasLastLoggedDebugStats;
+#endif
+};
+
+static void    FlushTrackedResourceBarriers(Cmd* pCmd);
+static uint8_t GetEdgeConsumerStages(uint32_t edges, uint32_t producerStage);
+
+static void MarkResourceBindingsDirty(Cmd* pCmd)
+{
+    ++pCmd->pResourceTracker->mBindingVersion;
+}
+
+static void ResetPassResourceAccesses(Cmd* pCmd)
+{
+    MetalResourceTracker* tracker = pCmd->pResourceTracker;
+    tracker->mPassAccessCount = 0;
+    tracker->mRecordedBindingVersion = UINT32_MAX;
+    ++tracker->mPassSerial;
+}
+
+#if defined(ENABLE_GRAPHICS_DEBUG)
+static const char* gMetalSyncStageNames[] = { "V", "F", "C", "T" };
+
+static void RecordMetalSyncDebugEdges(uint32_t* pEdgeCounts, uint32_t producerStage, uint8_t consumerStages)
+{
+    for (uint32_t consumerStage = 0; consumerStage < 4; ++consumerStage)
+    {
+        if (consumerStages & (1 << consumerStage))
+        {
+            ++pEdgeCounts[producerStage * 4 + consumerStage];
+        }
+    }
+}
+
+static NSString* GetMetalTrackedResourceDebugLabel(const MetalPendingBarrier* barrier)
+{
+    if (barrier->mScope & (BARRIER_FLAG_TEXTURES | BARRIER_FLAG_RENDERTARGETS))
+    {
+        const Texture* texture = (const Texture*)barrier->pResource;
+        return texture && texture->pTexture ? texture->pTexture.label : nil;
+    }
+    if (barrier->mScope & BARRIER_FLAG_BUFFERS)
+    {
+        const Buffer* buffer = (const Buffer*)barrier->pResource;
+        return buffer && buffer->pBuffer ? buffer->pBuffer.label : nil;
+    }
+    return nil;
+}
+
+static void SetMetalTrackedFenceDebugLabel(Cmd* pCmd, id<MTLFence> fence, uint32_t epochIndex, uint32_t producerStage,
+                                           uint8_t consumerStages)
+{
+    NSString* resourceLabel = nil;
+    uint32_t  resourceCount = 0;
+    for (uint32_t i = 0; i < pCmd->pResourceTracker->mPendingBarrierCount; ++i)
+    {
+        const MetalPendingBarrier* barrier = &pCmd->pResourceTracker->pPendingBarriers[i];
+        if (barrier->mClosed || barrier->mFenceEpoch != epochIndex)
+            continue;
+
+        const uint8_t consumers = GetEdgeConsumerStages(barrier->mHazardEdges & ~barrier->mIssuedEdges, producerStage);
+        if (!(consumers & consumerStages))
+            continue;
+
+        ++resourceCount;
+        if (!resourceLabel)
+            resourceLabel = GetMetalTrackedResourceDebugLabel(barrier);
+    }
+
+    char consumerName[16] = {};
+    size_t consumerNameLength = 0;
+    for (uint32_t consumerStage = 0; consumerStage < 4; ++consumerStage)
+    {
+        if (!(consumerStages & (1 << consumerStage)))
+            continue;
+        const int written = snprintf(consumerName + consumerNameLength, sizeof(consumerName) - consumerNameLength, "%s%s",
+                                     consumerNameLength ? "|" : "", gMetalSyncStageNames[consumerStage]);
+        if (written > 0)
+            consumerNameLength += min((size_t)written, sizeof(consumerName) - consumerNameLength - 1);
+    }
+
+    if (resourceLabel)
+    {
+        fence.label = resourceCount > 1
+                          ? [NSString stringWithFormat:@"RHI tracked %s->%s %@ +%u", gMetalSyncStageNames[producerStage], consumerName,
+                                                       resourceLabel, resourceCount - 1]
+                          : [NSString stringWithFormat:@"RHI tracked %s->%s %@", gMetalSyncStageNames[producerStage], consumerName,
+                                                       resourceLabel];
+    }
+    else
+    {
+        fence.label = [NSString stringWithFormat:@"RHI tracked %s->%s (%u resources)", gMetalSyncStageNames[producerStage],
+                                                 consumerName, resourceCount];
+    }
+}
+
+static void AppendMetalSyncDebugEdges(char* text, size_t capacity, size_t* pLength, const char* category,
+                                      const uint32_t* pEdgeCounts)
+{
+    bool wroteCategory = false;
+    for (uint32_t producerStage = 0; producerStage < 4; ++producerStage)
+    {
+        for (uint32_t consumerStage = 0; consumerStage < 4; ++consumerStage)
+        {
+            const uint32_t count = pEdgeCounts[producerStage * 4 + consumerStage];
+            if (!count || *pLength >= capacity - 1)
+                continue;
+
+            const int written = snprintf(text + *pLength, capacity - *pLength, "%s%s%s>%s=%u", wroteCategory ? "," : " ",
+                                         wroteCategory ? "" : category, gMetalSyncStageNames[producerStage],
+                                         gMetalSyncStageNames[consumerStage], count);
+            if (written > 0)
+                *pLength += min((size_t)written, capacity - *pLength - 1);
+            wroteCategory = true;
+        }
+    }
+}
+
+static void FinalizeMetalSyncDebug(Cmd* pCmd)
+{
+    MetalResourceTracker* tracker = pCmd->pResourceTracker;
+    const MetalSyncDebugStats* stats = &tracker->mDebugStats;
+    char summary[1024] = "[Metal Sync]";
+    size_t length = strlen(summary);
+
+    AppendMetalSyncDebugEdges(summary, sizeof(summary), &length, "fence:", stats->mTrackedFenceWaitEdges);
+    AppendMetalSyncDebugEdges(summary, sizeof(summary), &length, "barrier:", stats->mMemoryBarrierEdges);
+
+    const int written = snprintf(summary + length, sizeof(summary) - length,
+                                 " updates[V=%u,F=%u,C=%u,T=%u] coarse[forced=%u,noProducer=%u,unknownStage=%u,unsupportedStage=%u] "
+                                 "coarseWait[V=%u,F=%u,C=%u,T=%u] skippedNoProducer=%u",
+                                 stats->mTrackedFenceUpdates[0], stats->mTrackedFenceUpdates[1], stats->mTrackedFenceUpdates[2],
+                                 stats->mTrackedFenceUpdates[3], stats->mLegacyFenceUpdates[METAL_LEGACY_FENCE_FORCED],
+                                 stats->mLegacyFenceUpdates[METAL_LEGACY_FENCE_NO_PRODUCER],
+                                 stats->mLegacyFenceUpdates[METAL_LEGACY_FENCE_UNKNOWN_PRODUCER_STAGE],
+                                 stats->mLegacyFenceUpdates[METAL_LEGACY_FENCE_UNSUPPORTED_PRODUCER_STAGE],
+                                 stats->mLegacyFenceWaits[0], stats->mLegacyFenceWaits[1], stats->mLegacyFenceWaits[2],
+                                 stats->mLegacyFenceWaits[3], stats->mNoProducerBarrierSkips);
+    if (written > 0)
+        length += min((size_t)written, sizeof(summary) - length - 1);
+
+    if (pCmd->pCommandBuffer)
+    {
+        NSString* queueLabel = pCmd->pQueue->pCommandQueue.label ?: @"Metal command buffer";
+        pCmd->pCommandBuffer.label = [NSString stringWithFormat:@"%@ | %s", queueLabel, summary];
+    }
+
+    if (!tracker->mHasLastLoggedDebugStats ||
+        memcmp(stats, &tracker->mLastLoggedDebugStats, sizeof(MetalSyncDebugStats)) != 0)
+    {
+        LOGF(LogLevel::eINFO, "%s", summary);
+        tracker->mLastLoggedDebugStats = *stats;
+        tracker->mHasLastLoggedDebugStats = true;
+    }
+}
+#endif
+
+static uint32_t BuildResourceHazardEdges(uint8_t producerReadStages, uint8_t producerWriteStages, uint8_t consumerReadStages,
+                                         uint8_t consumerWriteStages)
+{
+    const uint8_t producerHazardStages = producerWriteStages | (consumerWriteStages ? producerReadStages : 0);
+    uint32_t      edges = 0;
+
+    for (uint32_t producerStage = 0; producerStage < 4; ++producerStage)
+    {
+        const uint8_t producerBit = 1 << producerStage;
+        if (!(producerHazardStages & producerBit))
+        {
+            continue;
+        }
+
+        uint8_t consumerHazardStages = 0;
+        if (producerWriteStages & producerBit)
+        {
+            consumerHazardStages |= consumerReadStages | consumerWriteStages;
+        }
+        if (producerReadStages & producerBit)
+        {
+            consumerHazardStages |= consumerWriteStages;
+        }
+
+        for (uint32_t consumerStage = 0; consumerStage < 4; ++consumerStage)
+        {
+            if (consumerHazardStages & (1 << consumerStage))
+            {
+                edges |= 1u << (producerStage * 4 + consumerStage);
+            }
+        }
+    }
+
+    return edges;
+}
+
+static void ResolvePendingResourceHazards(Cmd* pCmd, const void* pResource, uint8_t readStages, uint8_t writeStages)
+{
+    MetalResourceTracker* tracker = pCmd->pResourceTracker;
+    for (uint32_t i = 0; i < tracker->mPendingBarrierCount; ++i)
+    {
+        MetalPendingBarrier* barrier = &tracker->pPendingBarriers[i];
+        if (barrier->pResource != pResource || barrier->mClosed)
+        {
+            continue;
+        }
+
+        barrier->mHazardEdges |= BuildResourceHazardEdges(barrier->mProducerReadStages, barrier->mProducerWriteStages, readStages,
+                                                          writeStages);
+    }
+}
+
+static void TrackPassResourceAccess(Cmd* pCmd, const void* pResource, uint8_t readStages, uint8_t writeStages)
+{
+    if (!pResource || !(readStages | writeStages))
+    {
+        return;
+    }
+
+    ResolvePendingResourceHazards(pCmd, pResource, readStages, writeStages);
+
+    MetalResourceTracker* tracker = pCmd->pResourceTracker;
+    for (uint32_t i = 0; i < tracker->mPassAccessCount; ++i)
+    {
+        MetalResourceAccess* access = &tracker->pPassAccesses[i];
+        if (access->pResource == pResource)
+        {
+            access->mReadStages |= readStages;
+            access->mWriteStages |= writeStages;
+            return;
+        }
+    }
+
+    if (tracker->mPassAccessCount == tracker->mPassAccessCapacity)
+    {
+        tracker->mPassAccessCapacity = tracker->mPassAccessCapacity ? tracker->mPassAccessCapacity * 2 : 32;
+        tracker->pPassAccesses = (MetalResourceAccess*)tf_realloc(
+            tracker->pPassAccesses, tracker->mPassAccessCapacity * sizeof(MetalResourceAccess));
+    }
+
+    MetalResourceAccess* access = &tracker->pPassAccesses[tracker->mPassAccessCount++];
+    access->pResource = pResource;
+    access->mReadStages = readStages;
+    access->mWriteStages = writeStages;
+}
+
+static void ClearRootResourceBindings(Cmd* pCmd, uint32_t updateFrequency)
+{
+    MetalResourceTracker* tracker = pCmd->pResourceTracker;
+    for (uint32_t i = 0; i < tracker->mRootResourceCount;)
+    {
+        if (updateFrequency == UINT32_MAX || tracker->pRootResources[i].mUpdateFrequency == updateFrequency)
+        {
+            tracker->pRootResources[i] = tracker->pRootResources[--tracker->mRootResourceCount];
+            continue;
+        }
+        ++i;
+    }
+}
+
+static void TrackRootResourceBinding(Cmd* pCmd, uint32_t updateFrequency, const DescriptorInfo* pDesc, const void* pResource)
+{
+    MetalResourceTracker* tracker = pCmd->pResourceTracker;
+    for (uint32_t i = 0; i < tracker->mRootResourceCount; ++i)
+    {
+        MetalRootResourceBinding* binding = &tracker->pRootResources[i];
+        if (binding->pDescriptor == pDesc)
+        {
+            binding->pResource = pResource;
+            binding->mUpdateFrequency = (uint8_t)updateFrequency;
+            MarkResourceBindingsDirty(pCmd);
+            return;
+        }
+    }
+
+    if (tracker->mRootResourceCount == tracker->mRootResourceCapacity)
+    {
+        tracker->mRootResourceCapacity = tracker->mRootResourceCapacity ? tracker->mRootResourceCapacity * 2 : 4;
+        tracker->pRootResources = (MetalRootResourceBinding*)tf_realloc(
+            tracker->pRootResources, tracker->mRootResourceCapacity * sizeof(MetalRootResourceBinding));
+    }
+
+    MetalRootResourceBinding* binding = &tracker->pRootResources[tracker->mRootResourceCount++];
+    binding->pDescriptor = pDesc;
+    binding->pResource = pResource;
+    binding->mUpdateFrequency = (uint8_t)updateFrequency;
+    MarkResourceBindingsDirty(pCmd);
+}
+
+static const MetalRootResourceBinding* FindRootResourceBinding(const Cmd* pCmd, const DescriptorInfo* pDesc)
+{
+    const MetalResourceTracker* tracker = pCmd->pResourceTracker;
+    for (uint32_t i = 0; i < tracker->mRootResourceCount; ++i)
+    {
+        if (tracker->pRootResources[i].pDescriptor == pDesc)
+        {
+            return &tracker->pRootResources[i];
+        }
+    }
+    return NULL;
+}
+
+static void TrackBoundResourcesForCommand(Cmd* pCmd, uint8_t stageMask)
+{
+    MetalResourceTracker* tracker = pCmd->pResourceTracker;
+    if (tracker->mRecordedBindingVersion == tracker->mBindingVersion)
+    {
+        return;
+    }
+
+    for (uint32_t set = 0; set < DESCRIPTOR_UPDATE_FREQ_COUNT; ++set)
+    {
+        const DescriptorSet* descriptorSet = pCmd->mBoundDescriptorSets[set];
+        if (!descriptorSet)
+        {
+            continue;
+        }
+
+        const uint32_t index = pCmd->mBoundDescriptorSetIndices[set];
+        ASSERT(index < descriptorSet->mMaxSets);
+        const UntrackedResourceData* data = descriptorSet->ppUntrackedData[index];
+        if (!data)
+        {
+            continue;
+        }
+
+        for (uint32_t i = 0; i < data->mResourceUsageCount; ++i)
+        {
+            const DescriptorResourceUsage* usage = &data->pResourceUsages[i];
+            if (FindRootResourceBinding(pCmd, usage->pDescriptor))
+            {
+                continue;
+            }
+            TrackPassResourceAccess(pCmd, usage->pResource, usage->mReadStages & stageMask, usage->mWriteStages & stageMask);
+        }
+    }
+
+    for (uint32_t i = 0; i < tracker->mRootResourceCount; ++i)
+    {
+        const MetalRootResourceBinding* binding = &tracker->pRootResources[i];
+        TrackPassResourceAccess(pCmd, binding->pResource, (uint8_t)binding->pDescriptor->mReadStages & stageMask,
+                                (uint8_t)binding->pDescriptor->mWriteStages & stageMask);
+    }
+
+    if (stageMask & SHADER_STAGE_VERT)
+    {
+        for (uint32_t i = 0; i < tracker->mVertexBufferCount; ++i)
+        {
+            TrackPassResourceAccess(pCmd, tracker->ppVertexBuffers[i], SHADER_STAGE_VERT, SHADER_STAGE_NONE);
+        }
+    }
+
+    tracker->mRecordedBindingVersion = tracker->mBindingVersion;
+}
+
+static void TrackRenderPassAttachments(Cmd* pCmd, const BindRenderTargetsDesc* pDesc)
+{
+    for (uint32_t i = 0; i < pDesc->mRenderTargetCount; ++i)
+    {
+        const BindRenderTargetDesc* attachment = &pDesc->mRenderTargets[i];
+        const uint8_t readStages = attachment->mLoadAction == LOAD_ACTION_LOAD ? SHADER_STAGE_FRAG : SHADER_STAGE_NONE;
+        TrackPassResourceAccess(pCmd, attachment->pRenderTarget->pTexture, readStages, SHADER_STAGE_FRAG);
+
+#if defined(USE_MSAA_RESOLVE_ATTACHMENTS)
+        if ((attachment->mStoreAction == STORE_ACTION_RESOLVE_STORE ||
+             attachment->mStoreAction == STORE_ACTION_RESOLVE_DONTCARE) &&
+            attachment->pRenderTarget->pResolveAttachment)
+        {
+            TrackPassResourceAccess(pCmd, attachment->pRenderTarget->pResolveAttachment->pTexture, SHADER_STAGE_NONE,
+                                    SHADER_STAGE_FRAG);
+        }
+#endif
+    }
+
+    if (pDesc->mDepthStencil.pDepthStencil)
+    {
+        const BindDepthTargetDesc* attachment = &pDesc->mDepthStencil;
+        const bool load = attachment->mLoadAction == LOAD_ACTION_LOAD || attachment->mLoadActionStencil == LOAD_ACTION_LOAD;
+        TrackPassResourceAccess(pCmd, attachment->pDepthStencil->pTexture, load ? SHADER_STAGE_FRAG : SHADER_STAGE_NONE,
+                                SHADER_STAGE_FRAG);
+    }
+    FlushTrackedResourceBarriers(pCmd);
+}
+
+static MetalResourceAccess* FindPassResourceAccess(Cmd* pCmd, const void* pResource)
+{
+    MetalResourceTracker* tracker = pCmd->pResourceTracker;
+    for (uint32_t i = 0; i < tracker->mPassAccessCount; ++i)
+    {
+        if (tracker->pPassAccesses[i].pResource == pResource)
+        {
+            return &tracker->pPassAccesses[i];
+        }
+    }
+    return NULL;
+}
+
+static bool CaptureResourceBarrier(Cmd* pCmd, const void* pResource, uint8_t scope)
+{
+    ASSERT(pResource);
+    MetalResourceTracker* tracker = pCmd->pResourceTracker;
+    MetalPendingBarrier*  previousBarrier = NULL;
+
+    for (uint32_t i = 0; i < tracker->mPendingBarrierCount; ++i)
+    {
+        if (tracker->pPendingBarriers[i].pResource == pResource && !tracker->pPendingBarriers[i].mClosed)
+        {
+            previousBarrier = &tracker->pPendingBarriers[i];
+            tracker->pPendingBarriers[i].mClosed = true;
+        }
+    }
+
+    uint8_t              producerReadStages = METAL_ACCESS_STAGE_NONE;
+    uint8_t              producerWriteStages = METAL_ACCESS_STAGE_NONE;
+    uint32_t             producerPass = tracker->mPassSerial;
+    uint16_t             fenceEpoch = UINT16_MAX;
+    MetalResourceAccess* access = FindPassResourceAccess(pCmd, pResource);
+    if (access && (access->mReadStages | access->mWriteStages))
+    {
+        producerReadStages = access->mReadStages;
+        producerWriteStages = access->mWriteStages;
+        access->mReadStages = METAL_ACCESS_STAGE_NONE;
+        access->mWriteStages = METAL_ACCESS_STAGE_NONE;
+    }
+    else if (previousBarrier)
+    {
+        // Collapse consecutive transitions with no intervening resource use.
+        // The latest transition retains the original producer and its already
+        // emitted fence epoch, if any.
+        producerReadStages = previousBarrier->mProducerReadStages;
+        producerWriteStages = previousBarrier->mProducerWriteStages;
+        producerPass = previousBarrier->mProducerPass;
+        fenceEpoch = previousBarrier->mFenceEpoch;
+    }
+    else
+    {
+        // Resource-state flags describe how a resource may be used, not evidence that the
+        // current command buffer actually used it. Inventing a producer here couples an
+        // unrelated encoder to the next consumer (for example UI -> shadow pass). All
+        // Metal resource access paths above are tracked explicitly, so no observation means
+        // there is no same-command-buffer dependency to encode.
+#if defined(ENABLE_GRAPHICS_DEBUG)
+        ++tracker->mDebugStats.mNoProducerBarrierSkips;
+#endif
+        return false;
+    }
+    // The next draw/dispatch starts a new access epoch even if no bindings changed.
+    tracker->mRecordedBindingVersion = UINT32_MAX;
+
+    ASSERT(tracker->mPendingBarrierCount < UINT16_MAX);
+    if (tracker->mPendingBarrierCount == tracker->mPendingBarrierCapacity)
+    {
+        tracker->mPendingBarrierCapacity = tracker->mPendingBarrierCapacity ? tracker->mPendingBarrierCapacity * 2 : 16;
+        tracker->pPendingBarriers = (MetalPendingBarrier*)tf_realloc(
+            tracker->pPendingBarriers, tracker->mPendingBarrierCapacity * sizeof(MetalPendingBarrier));
+    }
+
+    MetalPendingBarrier* barrier = &tracker->pPendingBarriers[tracker->mPendingBarrierCount++];
+    *barrier = {};
+    barrier->pResource = pResource;
+    barrier->mProducerPass = producerPass;
+    barrier->mProducerReadStages = producerReadStages;
+    barrier->mProducerWriteStages = producerWriteStages;
+    barrier->mScope = scope;
+    barrier->mFenceEpoch = fenceEpoch;
+    return true;
+}
+
+static uint16_t AcquireTrackedFence(Cmd* pCmd)
+{
+    MetalResourceTracker* tracker = pCmd->pResourceTracker;
+    ASSERT(tracker->mFenceCursor < UINT16_MAX);
+    const uint16_t fenceIndex = tracker->mFenceCursor++;
+    if (fenceIndex == tracker->pFencePool.count)
+    {
+        [tracker->pFencePool addObject:[pCmd->pRenderer->pDevice newFence]];
+    }
+    return fenceIndex;
+}
+
+static id<MTLFence> GetTrackedFence(const Cmd* pCmd, uint16_t fenceIndex)
+{
+    ASSERT(fenceIndex != UINT16_MAX && fenceIndex < pCmd->pResourceTracker->pFencePool.count);
+    return pCmd->pResourceTracker->pFencePool[fenceIndex];
+}
+
+static MetalTrackedFenceUpdateResult EmitTrackedFenceUpdates(Cmd* pCmd)
+{
+    MetalResourceTracker* tracker = pCmd->pResourceTracker;
+    uint8_t                producerStages = METAL_ACCESS_STAGE_NONE;
+    bool                   hasPendingProducer = false;
+
+    for (uint32_t i = 0; i < tracker->mPendingBarrierCount; ++i)
+    {
+        const MetalPendingBarrier* barrier = &tracker->pPendingBarriers[i];
+        if (!barrier->mClosed && barrier->mProducerPass == tracker->mPassSerial && barrier->mFenceEpoch == UINT16_MAX)
+        {
+            hasPendingProducer = true;
+            producerStages |= barrier->mProducerReadStages | barrier->mProducerWriteStages;
+        }
+    }
+    if (!hasPendingProducer)
+    {
+        return METAL_TRACKED_FENCE_NO_PRODUCER;
+    }
+    // Resource types outside the tracked render/compute/blit scope use the
+    // existing coarse fence path.
+    if (!producerStages)
+    {
+        return METAL_TRACKED_FENCE_UNKNOWN_PRODUCER_STAGE;
+    }
+
+    uint8_t supportedStages = METAL_ACCESS_STAGE_NONE;
+    if (pCmd->pRenderEncoder)
+        supportedStages = METAL_ACCESS_STAGE_VERTEX | METAL_ACCESS_STAGE_FRAGMENT;
+    else if (pCmd->pComputeEncoder)
+        supportedStages = METAL_ACCESS_STAGE_COMPUTE;
+    else if (pCmd->pBlitEncoder)
+        supportedStages = METAL_ACCESS_STAGE_TRANSFER;
+
+    if (producerStages & ~supportedStages)
+    {
+        return METAL_TRACKED_FENCE_UNSUPPORTED_PRODUCER_STAGE;
+    }
+
+    ASSERT(tracker->mFenceEpochCount < UINT16_MAX);
+    if (tracker->mFenceEpochCount == tracker->mFenceEpochCapacity)
+    {
+        tracker->mFenceEpochCapacity = tracker->mFenceEpochCapacity ? tracker->mFenceEpochCapacity * 2 : 8;
+        tracker->pFenceEpochs =
+            (MetalFenceEpoch*)tf_realloc(tracker->pFenceEpochs, tracker->mFenceEpochCapacity * sizeof(MetalFenceEpoch));
+    }
+
+    const uint16_t epochIndex = tracker->mFenceEpochCount++;
+    MetalFenceEpoch* epoch = &tracker->pFenceEpochs[epochIndex];
+    for (uint32_t stage = 0; stage < 4; ++stage)
+    {
+        epoch->mFenceIndices[stage] = UINT16_MAX;
+    }
+
+    if (producerStages & METAL_ACCESS_STAGE_VERTEX)
+    {
+        epoch->mFenceIndices[0] = AcquireTrackedFence(pCmd);
+        [pCmd->pRenderEncoder updateFence:GetTrackedFence(pCmd, epoch->mFenceIndices[0]) afterStages:MTLRenderStageVertex];
+#if defined(ENABLE_GRAPHICS_DEBUG)
+        ++tracker->mDebugStats.mTrackedFenceUpdates[0];
+#endif
+    }
+    if (producerStages & METAL_ACCESS_STAGE_FRAGMENT)
+    {
+        epoch->mFenceIndices[1] = AcquireTrackedFence(pCmd);
+        [pCmd->pRenderEncoder updateFence:GetTrackedFence(pCmd, epoch->mFenceIndices[1]) afterStages:MTLRenderStageFragment];
+#if defined(ENABLE_GRAPHICS_DEBUG)
+        ++tracker->mDebugStats.mTrackedFenceUpdates[1];
+#endif
+    }
+    if (producerStages & METAL_ACCESS_STAGE_COMPUTE)
+    {
+        epoch->mFenceIndices[2] = AcquireTrackedFence(pCmd);
+        [pCmd->pComputeEncoder updateFence:GetTrackedFence(pCmd, epoch->mFenceIndices[2])];
+#if defined(ENABLE_GRAPHICS_DEBUG)
+        ++tracker->mDebugStats.mTrackedFenceUpdates[2];
+#endif
+    }
+    if (producerStages & METAL_ACCESS_STAGE_TRANSFER)
+    {
+        epoch->mFenceIndices[3] = AcquireTrackedFence(pCmd);
+        [pCmd->pBlitEncoder updateFence:GetTrackedFence(pCmd, epoch->mFenceIndices[3])];
+#if defined(ENABLE_GRAPHICS_DEBUG)
+        ++tracker->mDebugStats.mTrackedFenceUpdates[3];
+#endif
+    }
+    for (uint32_t i = 0; i < tracker->mPendingBarrierCount; ++i)
+    {
+        MetalPendingBarrier* barrier = &tracker->pPendingBarriers[i];
+        if (!barrier->mClosed && barrier->mProducerPass == tracker->mPassSerial && barrier->mFenceEpoch == UINT16_MAX)
+        {
+            barrier->mFenceEpoch = epochIndex;
+        }
+    }
+    return METAL_TRACKED_FENCE_EMITTED;
+}
+
+static MTLBarrierScope GetTrackedBarrierScope(uint8_t scopeFlags)
+{
+    MTLBarrierScope scope = (MTLBarrierScope)0;
+    if (scopeFlags & BARRIER_FLAG_BUFFERS)
+        scope |= MTLBarrierScopeBuffers;
+    if (scopeFlags & BARRIER_FLAG_TEXTURES)
+        scope |= MTLBarrierScopeTextures;
+#if !defined(TARGET_IOS)
+    if (scopeFlags & BARRIER_FLAG_RENDERTARGETS)
+        scope |= MTLBarrierScopeRenderTargets;
+#endif
+    return scope;
+}
+
+static MTLRenderStages GetTrackedRenderStages(uint8_t accessStages)
+{
+    MTLRenderStages stages = (MTLRenderStages)0;
+    if (accessStages & METAL_ACCESS_STAGE_VERTEX)
+        stages |= MTLRenderStageVertex;
+    if (accessStages & METAL_ACCESS_STAGE_FRAGMENT)
+        stages |= MTLRenderStageFragment;
+    return stages;
+}
+
+static uint8_t GetEdgeConsumerStages(uint32_t edges, uint32_t producerStage)
+{
+    return (uint8_t)((edges >> (producerStage * 4)) & 0x0f);
+}
+
+static void MarkBarrierEdgesIssued(MetalPendingBarrier* barrier, uint32_t producerStage, uint8_t consumerStages)
+{
+    const uint32_t edgeMask = ((uint32_t)consumerStages & 0x0f) << (producerStage * 4);
+    barrier->mIssuedEdges |= barrier->mHazardEdges & edgeMask;
+}
+
+static void FlushTrackedResourceBarriers(Cmd* pCmd)
+{
+    MetalResourceTracker* tracker = pCmd->pResourceTracker;
+
+#if defined(ENABLE_MEMORY_BARRIERS_GRAPHICS)
+    // Barriers inside one render encoder can preserve the same stage overlap as
+    // fences between encoders. Group scopes by producer stage to avoid emitting
+    // one GPU barrier per resource.
+    if (pCmd->pRenderEncoder)
+    {
+        for (uint32_t producerStage = 0; producerStage < 2; ++producerStage)
+        {
+            uint8_t consumerStages = METAL_ACCESS_STAGE_NONE;
+            uint8_t scopeFlags = 0;
+            for (uint32_t i = 0; i < tracker->mPendingBarrierCount; ++i)
+            {
+                MetalPendingBarrier* barrier = &tracker->pPendingBarriers[i];
+                if (barrier->mClosed || barrier->mFenceEpoch != UINT16_MAX || barrier->mProducerPass != tracker->mPassSerial)
+                    continue;
+                const uint32_t newEdges = barrier->mHazardEdges & ~barrier->mIssuedEdges;
+                const uint8_t  consumers = GetEdgeConsumerStages(newEdges, producerStage) & SHADER_STAGE_ALL_GRAPHICS;
+                if (consumers)
+                {
+                    consumerStages |= consumers;
+                    scopeFlags |= barrier->mScope;
+                }
+            }
+
+            if (consumerStages)
+            {
+                [pCmd->pRenderEncoder memoryBarrierWithScope:GetTrackedBarrierScope(scopeFlags)
+                                                 afterStages:GetTrackedRenderStages(1 << producerStage)
+                                                beforeStages:GetTrackedRenderStages(consumerStages)];
+#if defined(ENABLE_GRAPHICS_DEBUG)
+                RecordMetalSyncDebugEdges(tracker->mDebugStats.mMemoryBarrierEdges, producerStage, consumerStages);
+#endif
+                for (uint32_t i = 0; i < tracker->mPendingBarrierCount; ++i)
+                {
+                    MetalPendingBarrier* barrier = &tracker->pPendingBarriers[i];
+                    if (!barrier->mClosed && barrier->mFenceEpoch == UINT16_MAX &&
+                        barrier->mProducerPass == tracker->mPassSerial)
+                    {
+                        MarkBarrierEdgesIssued(barrier, producerStage, consumerStages);
+                    }
+                }
+            }
+        }
+    }
+#endif
+    if (pCmd->pComputeEncoder)
+    {
+        uint8_t scopeFlags = 0;
+        bool    needsBarrier = false;
+        for (uint32_t i = 0; i < tracker->mPendingBarrierCount; ++i)
+        {
+            MetalPendingBarrier* barrier = &tracker->pPendingBarriers[i];
+            if (!barrier->mClosed && barrier->mFenceEpoch == UINT16_MAX && barrier->mProducerPass == tracker->mPassSerial &&
+                (barrier->mHazardEdges & ~barrier->mIssuedEdges))
+            {
+                needsBarrier = true;
+                scopeFlags |= barrier->mScope;
+            }
+        }
+        if (needsBarrier)
+        {
+            [pCmd->pComputeEncoder memoryBarrierWithScope:GetTrackedBarrierScope(scopeFlags)];
+#if defined(ENABLE_GRAPHICS_DEBUG)
+            RecordMetalSyncDebugEdges(tracker->mDebugStats.mMemoryBarrierEdges, 2, METAL_ACCESS_STAGE_COMPUTE);
+#endif
+            for (uint32_t i = 0; i < tracker->mPendingBarrierCount; ++i)
+            {
+                MetalPendingBarrier* barrier = &tracker->pPendingBarriers[i];
+                if (!barrier->mClosed && barrier->mFenceEpoch == UINT16_MAX &&
+                    barrier->mProducerPass == tracker->mPassSerial)
+                {
+                    barrier->mIssuedEdges = barrier->mHazardEdges;
+                }
+            }
+        }
+    }
+
+    // Between encoders, each epoch owns an independent fence for every producer
+    // stage. Waiting on a fragment fence can therefore never delay a dependency
+    // that was complete at the vertex frontier.
+    for (uint32_t epochIndex = 0; epochIndex < tracker->mFenceEpochCount; ++epochIndex)
+    {
+        const MetalFenceEpoch* epoch = &tracker->pFenceEpochs[epochIndex];
+        for (uint32_t producerStage = 0; producerStage < 4; ++producerStage)
+        {
+            if (epoch->mFenceIndices[producerStage] == UINT16_MAX)
+                continue;
+
+            uint8_t consumerStages = METAL_ACCESS_STAGE_NONE;
+            for (uint32_t i = 0; i < tracker->mPendingBarrierCount; ++i)
+            {
+                const MetalPendingBarrier* barrier = &tracker->pPendingBarriers[i];
+                if (!barrier->mClosed && barrier->mFenceEpoch == epochIndex)
+                {
+                    consumerStages |= GetEdgeConsumerStages(barrier->mHazardEdges & ~barrier->mIssuedEdges, producerStage);
+                }
+            }
+            if (!consumerStages)
+                continue;
+
+            id<MTLFence> fence = GetTrackedFence(pCmd, epoch->mFenceIndices[producerStage]);
+            uint8_t      issuedConsumerStages = METAL_ACCESS_STAGE_NONE;
+            if (pCmd->pRenderEncoder)
+            {
+                issuedConsumerStages = consumerStages & SHADER_STAGE_ALL_GRAPHICS;
+                if (issuedConsumerStages)
+                    [pCmd->pRenderEncoder waitForFence:fence beforeStages:GetTrackedRenderStages(issuedConsumerStages)];
+            }
+            else if (pCmd->pComputeEncoder && (consumerStages & METAL_ACCESS_STAGE_COMPUTE))
+            {
+                issuedConsumerStages = METAL_ACCESS_STAGE_COMPUTE;
+                [pCmd->pComputeEncoder waitForFence:fence];
+            }
+            else if (pCmd->pBlitEncoder && (consumerStages & METAL_ACCESS_STAGE_TRANSFER))
+            {
+                issuedConsumerStages = METAL_ACCESS_STAGE_TRANSFER;
+                [pCmd->pBlitEncoder waitForFence:fence];
+            }
+            if (issuedConsumerStages)
+            {
+#if defined(ENABLE_GRAPHICS_DEBUG)
+                SetMetalTrackedFenceDebugLabel(pCmd, fence, epochIndex, producerStage, issuedConsumerStages);
+                RecordMetalSyncDebugEdges(tracker->mDebugStats.mTrackedFenceWaitEdges, producerStage, issuedConsumerStages);
+#endif
+                for (uint32_t i = 0; i < tracker->mPendingBarrierCount; ++i)
+                {
+                    MetalPendingBarrier* barrier = &tracker->pPendingBarriers[i];
+                    if (!barrier->mClosed && barrier->mFenceEpoch == epochIndex)
+                    {
+                        MarkBarrierEdgesIssued(barrier, producerStage, issuedConsumerStages);
+                    }
+                }
+            }
+        }
+    }
+
+    tracker->mBarrierFlags &= BARRIER_FLAG_FENCE;
+}
 
 void util_end_current_encoders(Cmd* pCmd, bool forceBarrier);
 void util_barrier_update(Cmd* pCmd, const QueueType& encoderType);
@@ -407,7 +1274,8 @@ void mtl_cmdBindDescriptorSet(Cmd* pCmd, uint32_t index, DescriptorSet* pDescrip
     ASSERT(pDescriptorSet);
     ASSERT(index < pDescriptorSet->mMaxSets);
 
-    if (pDescriptorSet->pRootSignature != pCmd->pUsedRootSignature)
+    const bool rootSignatureChanged = pDescriptorSet->pRootSignature != pCmd->pUsedRootSignature;
+    if (rootSignatureChanged)
     {
         pCmd->mShouldRebindDescriptorSets = 0;
         pCmd->pUsedRootSignature = pDescriptorSet->pRootSignature;
@@ -415,10 +1283,16 @@ void mtl_cmdBindDescriptorSet(Cmd* pCmd, uint32_t index, DescriptorSet* pDescrip
         {
             pCmd->mBoundDescriptorSets[i] = NULL;
         }
+        ClearRootResourceBindings(pCmd, UINT32_MAX);
+    }
+    else
+    {
+        ClearRootResourceBindings(pCmd, pDescriptorSet->mUpdateFrequency);
     }
     pCmd->mBoundDescriptorSets[pDescriptorSet->mUpdateFrequency] = pDescriptorSet;
     pCmd->mBoundDescriptorSetIndices[pDescriptorSet->mUpdateFrequency] = index;
     pCmd->mShouldRebindDescriptorSets &= ~(1 << (int)pDescriptorSet->mUpdateFrequency);
+    MarkResourceBindingsDirty(pCmd);
 
     if (pDescriptorSet->pRootDescriptorData)
     {
@@ -575,6 +1449,8 @@ void mtl_cmdBindPushConstants(Cmd* pCmd, RootSignature* pRootSignature, uint32_t
         {
             pCmd->mBoundDescriptorSets[i] = NULL;
         }
+        ClearRootResourceBindings(pCmd, UINT32_MAX);
+        MarkResourceBindingsDirty(pCmd);
     }
     util_bind_push_constant(pCmd, pDesc, pConstants);
 }
@@ -635,6 +1511,7 @@ void mtl_cmdBindDescriptorSetWithRootCbvs(Cmd* pCmd, uint32_t index, DescriptorS
         handle.pOffsets = &offset;
         handle.mCount = 1;
         util_bind_root_cbv(pCmd, &handle);
+        TrackRootResourceBinding(pCmd, pDescriptorSet->mUpdateFrequency, pDesc, pParam->ppBuffers[0]);
     }
 }
 
@@ -664,10 +1541,8 @@ void mtl_addDescriptorSet(Renderer* pRenderer, const DescriptorSetDesc* pDesc, D
         totalSize += pDesc->mMaxSets * pRootSignature->mRootSamplerCounts[updateFreq] * sizeof(RootDescriptorHandle);
     }
 
-    if (pRootSignature->mArgumentDescriptors[pDesc->mUpdateFrequency].count)
-    {
-        totalSize += pDesc->mMaxSets * sizeof(UntrackedResourceData*);
-    }
+    // Resource-stage metadata is also required by root-only descriptor sets.
+    totalSize += pDesc->mMaxSets * sizeof(UntrackedResourceData*);
 
     DescriptorSet* pDescriptorSet = (DescriptorSet*)tf_calloc_memalign(1, alignof(DescriptorSet), totalSize);
     ASSERT(pDescriptorSet);
@@ -699,6 +1574,9 @@ void mtl_addDescriptorSet(Renderer* pRenderer, const DescriptorSetDesc* pDesc, D
             mem += pRootSignature->mRootSamplerCounts[updateFreq] * sizeof(RootDescriptorHandle);
         }
     }
+
+    pDescriptorSet->ppUntrackedData = (UntrackedResourceData**)mem;
+    mem += pDesc->mMaxSets * sizeof(UntrackedResourceData*);
 
     NSMutableArray<MTLArgumentDescriptor*>* descriptors = pRootSignature->mArgumentDescriptors[pDesc->mUpdateFrequency];
 
@@ -744,8 +1622,6 @@ void mtl_addDescriptorSet(Renderer* pRenderer, const DescriptorSetDesc* pDesc, D
         pDescriptorSet->mStride = argumentBufferSize;
         pDescriptorSet->mStages = shaderStages;
 
-        pDescriptorSet->ppUntrackedData = (UntrackedResourceData**)mem;
-        mem += pDesc->mMaxSets * sizeof(UntrackedResourceData*);
     }
 
     // bind static samplers
@@ -874,15 +1750,16 @@ void mtl_removeDescriptorSet(Renderer* pRenderer, DescriptorSet* pDescriptorSet)
     if (pDescriptorSet->mArgumentBuffer)
     {
         removeBuffer(pRenderer, pDescriptorSet->mArgumentBuffer);
+    }
 
-        for (uint32_t set = 0; set < pDescriptorSet->mMaxSets; ++set)
+    for (uint32_t set = 0; set < pDescriptorSet->mMaxSets; ++set)
+    {
+        if (pDescriptorSet->ppUntrackedData[set])
         {
-            if (pDescriptorSet->ppUntrackedData[set])
-            {
-                SAFE_FREE(pDescriptorSet->ppUntrackedData[set]->mData.pResources);
-                SAFE_FREE(pDescriptorSet->ppUntrackedData[set]->mRWData.pResources);
-                SAFE_FREE(pDescriptorSet->ppUntrackedData[set]);
-            }
+            SAFE_FREE(pDescriptorSet->ppUntrackedData[set]->mData.pResources);
+            SAFE_FREE(pDescriptorSet->ppUntrackedData[set]->mRWData.pResources);
+            SAFE_FREE(pDescriptorSet->ppUntrackedData[set]->pResourceUsages);
+            SAFE_FREE(pDescriptorSet->ppUntrackedData[set]);
         }
     }
 
@@ -926,14 +1803,54 @@ void mtl_removeDescriptorSet(Renderer* pRenderer, DescriptorSet* pDescriptorSet)
 
 // UAVs, RTs inside arg buffers need to be tracked manually through useResource
 // useHeap ignores all resources with UAV, RT flags
-static void TrackUntrackedResource(DescriptorSet* pDescriptorSet, uint32_t index, const MTLResourceUsage usage, id<MTLResource> resource)
+static UntrackedResourceData* GetResourceData(DescriptorSet* pDescriptorSet, uint32_t index)
 {
     if (!pDescriptorSet->ppUntrackedData[index])
     {
         pDescriptorSet->ppUntrackedData[index] = (UntrackedResourceData*)tf_calloc(1, sizeof(UntrackedResourceData));
     }
 
-    UntrackedResourceData*  untracked = pDescriptorSet->ppUntrackedData[index];
+    return pDescriptorSet->ppUntrackedData[index];
+}
+
+static void TrackDescriptorResource(DescriptorSet* pDescriptorSet, uint32_t index, const DescriptorInfo* pDesc,
+                                    uint32_t arrayIndex, const void* pResource)
+{
+    ASSERT(pResource);
+    ASSERT(arrayIndex <= UINT16_MAX);
+
+    UntrackedResourceData* data = GetResourceData(pDescriptorSet, index);
+    for (uint32_t i = 0; i < data->mResourceUsageCount; ++i)
+    {
+        DescriptorResourceUsage* usage = &data->pResourceUsages[i];
+        if (usage->pDescriptor == pDesc && usage->mArrayIndex == arrayIndex)
+        {
+            usage->pResource = pResource;
+            usage->mReadStages = (uint8_t)pDesc->mReadStages;
+            usage->mWriteStages = (uint8_t)pDesc->mWriteStages;
+            return;
+        }
+    }
+
+    if (data->mResourceUsageCount == data->mResourceUsageCapacity)
+    {
+        data->mResourceUsageCapacity = data->mResourceUsageCapacity ? data->mResourceUsageCapacity * 2 : 8;
+        data->pResourceUsages = (DescriptorResourceUsage*)tf_realloc(
+            data->pResourceUsages, data->mResourceUsageCapacity * sizeof(DescriptorResourceUsage));
+    }
+
+    DescriptorResourceUsage* usage = &data->pResourceUsages[data->mResourceUsageCount++];
+    usage->pDescriptor = pDesc;
+    usage->pResource = pResource;
+    usage->mArrayIndex = (uint16_t)arrayIndex;
+    usage->mReadStages = (uint8_t)pDesc->mReadStages;
+    usage->mWriteStages = (uint8_t)pDesc->mWriteStages;
+}
+
+static void TrackUntrackedResource(DescriptorSet* pDescriptorSet, uint32_t index, const MTLResourceUsage usage, id<MTLResource> resource)
+{
+    UntrackedResourceData* untracked = GetResourceData(pDescriptorSet, index);
+
     UntrackedResourceArray* dataArray = (usage & MTLResourceUsageWrite) ? &untracked->mRWData : &untracked->mData;
 
     if (dataArray->mCount >= dataArray->mCapacity)
@@ -954,6 +1871,7 @@ static void BindICBDescriptor(DescriptorSet* pDescriptorSet, uint32_t index, con
                                                            atIndex:pDesc->mHandleIndex + arrayStart + j];
 
         TrackUntrackedResource(pDescriptorSet, index, MTLResourceUsageWrite, pParam->ppBuffers[j]->pIndirectCommandBuffer);
+        TrackDescriptorResource(pDescriptorSet, index, pDesc, arrayStart + j, pParam->ppBuffers[j]);
     }
 }
 
@@ -1059,6 +1977,7 @@ void mtl_updateDescriptorSet(Renderer* pRenderer, uint32_t index, DescriptorSet*
                         {
                             TrackUntrackedResource(pDescriptorSet, index, pDesc->mUsage, untracked);
                         }
+                        TrackDescriptorResource(pDescriptorSet, index, pDesc, arrayStart + j, texture);
                     }
                 }
                 else
@@ -1081,6 +2000,7 @@ void mtl_updateDescriptorSet(Renderer* pRenderer, uint32_t index, DescriptorSet*
                         {
                             pData->pArr[j] = pParam->ppTextures[j]->pTexture;
                         }
+                        TrackDescriptorResource(pDescriptorSet, index, pDesc, arrayStart + j, pParam->ppTextures[j]);
                     }
                 }
                 break;
@@ -1097,6 +2017,7 @@ void mtl_updateDescriptorSet(Renderer* pRenderer, uint32_t index, DescriptorSet*
                             [pDescriptorSet->mArgumentEncoder setTexture:texture->pUAVDescriptors[j]
                                                                  atIndex:pDesc->mHandleIndex + arrayStart + j];
                             TrackUntrackedResource(pDescriptorSet, index, pDesc->mUsage, texture->pUAVDescriptors[j]);
+                            TrackDescriptorResource(pDescriptorSet, index, pDesc, arrayStart + j, texture);
                         }
                     }
                     else
@@ -1107,6 +2028,7 @@ void mtl_updateDescriptorSet(Renderer* pRenderer, uint32_t index, DescriptorSet*
                             [pDescriptorSet->mArgumentEncoder setTexture:texture->pUAVDescriptors[pParam->mUAVMipSlice]
                                                                  atIndex:pDesc->mHandleIndex + arrayStart + j];
                             TrackUntrackedResource(pDescriptorSet, index, pDesc->mUsage, texture->pUAVDescriptors[pParam->mUAVMipSlice]);
+                            TrackDescriptorResource(pDescriptorSet, index, pDesc, arrayStart + j, texture);
                         }
                     }
                 }
@@ -1119,6 +2041,7 @@ void mtl_updateDescriptorSet(Renderer* pRenderer, uint32_t index, DescriptorSet*
                     for (uint32_t j = 0; j < arrayCount; ++j)
                     {
                         pData->pArr[j] = pParam->ppTextures[j]->pUAVDescriptors[pParam->mUAVMipSlice];
+                        TrackDescriptorResource(pDescriptorSet, index, pDesc, arrayStart + j, pParam->ppTextures[j]);
                     }
                 }
                 break;
@@ -1155,6 +2078,7 @@ void mtl_updateDescriptorSet(Renderer* pRenderer, uint32_t index, DescriptorSet*
                             {
                                 TrackUntrackedResource(pDescriptorSet, index, pDesc->mUsage, buffer->pBuffer);
                             }
+                            TrackDescriptorResource(pDescriptorSet, index, pDesc, arrayStart + j, buffer);
                         }
 
                         if (pRenderer->pGpu->mSettings.mIndirectCommandBuffer && pParam->mBindICB)
@@ -1188,6 +2112,7 @@ void mtl_updateDescriptorSet(Renderer* pRenderer, uint32_t index, DescriptorSet*
                     {
                         pData->pArr[j] = pParam->ppBuffers[j]->pBuffer;
                         pData->pOffsets[j] = pParam->ppBuffers[j]->mOffset + (pParam->pRanges ? pParam->pRanges[j].mOffset : 0);
+                        TrackDescriptorResource(pDescriptorSet, index, pDesc, arrayStart + j, pParam->ppBuffers[j]);
                     }
 
                     if (pRenderer->pGpu->mSettings.mIndirectCommandBuffer)
@@ -1228,6 +2153,8 @@ void mtl_updateDescriptorSet(Renderer* pRenderer, uint32_t index, DescriptorSet*
                             [pDescriptorSet->mArgumentEncoder setAccelerationStructure:as atIndex:pDesc->mHandleIndex + arrayStart + j];
 
                             TrackUntrackedResource(pDescriptorSet, index, pDesc->mUsage, as);
+                            TrackDescriptorResource(pDescriptorSet, index, pDesc, arrayStart + j,
+                                                    pParam->ppAccelerationStructures[j]);
                             extern void getMTLAccelerationStructureBottomReferences(
                                 AccelerationStructure * pAccelerationStructure, uint32_t * pOutReferenceCount, NOREFS id * *pOutReferences);
                             uint32_t bottomRefCount = 0;
@@ -1251,6 +2178,7 @@ void mtl_updateDescriptorSet(Renderer* pRenderer, uint32_t index, DescriptorSet*
                         pData->mStage = pDesc->mUsedStages;
                         resize_roothandle(pData, arrayCount);
                         pData->pArr[0] = getMTLAccelerationStructure(pParam->ppAccelerationStructures[0]);
+                        TrackDescriptorResource(pDescriptorSet, index, pDesc, arrayStart, pParam->ppAccelerationStructures[0]);
 
                         extern void getMTLAccelerationStructureBottomReferences(AccelerationStructure * pAccelerationStructure,
                                                                                 uint32_t * pOutReferenceCount, NOREFS id * *pOutReferences);
@@ -2525,8 +3453,6 @@ void mtl_addQueue(Renderer* pRenderer, QueueDesc* pDesc, Queue** ppQueue)
     pQueue->pCommandQueue = [pRenderer->pDevice newCommandQueueWithMaxCommandBufferCount:512];
     [pQueue->pCommandQueue setLabel:[NSString stringWithUTF8String:(pDesc->pName ? pDesc->pName : queueNames[pDesc->mType])]];
 
-    pQueue->mBarrierFlags = 0;
-    pQueue->pQueueFence = [pRenderer->pDevice newFence];
     ASSERT(pQueue->pCommandQueue != nil);
 
     *ppQueue = pQueue;
@@ -2537,8 +3463,6 @@ void mtl_removeQueue(Renderer* pRenderer, Queue* pQueue)
     ASSERT(pQueue);
 
     pQueue->pCommandQueue = nil;
-    pQueue->pQueueFence = nil;
-
     SAFE_FREE(pQueue);
 }
 
@@ -2573,6 +3497,10 @@ void mtl_addCmd(Renderer* pRenderer, const CmdDesc* pDesc, Cmd** ppCmd)
 
     pCmd->pRenderer = pRenderer;
     pCmd->pQueue = pDesc->pPool->pQueue;
+    pCmd->pResourceTracker = (MetalResourceTracker*)tf_calloc(1, sizeof(MetalResourceTracker));
+    ASSERT(pCmd->pResourceTracker);
+    pCmd->pResourceTracker->pFencePool = [[NSMutableArray alloc] init];
+    pCmd->pResourceTracker->pLegacyFence = [pRenderer->pDevice newFence];
 
     *ppCmd = pCmd;
 }
@@ -2581,6 +3509,14 @@ void mtl_removeCmd(Renderer* pRenderer, Cmd* pCmd)
 {
     ASSERT(pCmd);
     pCmd->pCommandBuffer = nil;
+
+    SAFE_FREE(pCmd->pResourceTracker->pPassAccesses);
+    SAFE_FREE(pCmd->pResourceTracker->pRootResources);
+    SAFE_FREE(pCmd->pResourceTracker->pPendingBarriers);
+    SAFE_FREE(pCmd->pResourceTracker->pFenceEpochs);
+    pCmd->pResourceTracker->pFencePool = nil;
+    pCmd->pResourceTracker->pLegacyFence = nil;
+    SAFE_FREE(pCmd->pResourceTracker);
 
     SAFE_FREE(pCmd);
 }
@@ -3415,6 +4351,8 @@ void mtl_addRootSignature(Renderer* pRenderer, const RootSignatureDesc* pRootSig
                     shput(indexMap, pRes->name, val);
 
                     it->used_stages |= pRes->used_stages;
+                    it->read_stages |= pRes->read_stages;
+                    it->write_stages |= pRes->write_stages;
                 }
             }
             // If the resource was already collected, just update the shader stage mask in case it is used in a different
@@ -3450,6 +4388,8 @@ void mtl_addRootSignature(Renderer* pRenderer, const RootSignatureDesc* pRootSig
                     if (strcmp(pCur->name, pNode->key) == 0)
                     {
                         pCur->used_stages |= pRes->used_stages;
+                        pCur->read_stages |= pRes->read_stages;
+                        pCur->write_stages |= pRes->write_stages;
                         break;
                     }
                 }
@@ -3488,6 +4428,8 @@ void mtl_addRootSignature(Renderer* pRenderer, const RootSignatureDesc* pRootSig
             //                pDesc->mDesc.alignment = pRes->alignment;
             pDesc->mType = pRes->type;
             pDesc->mUsedStages = pRes->used_stages;
+            pDesc->mReadStages = pRes->read_stages;
+            pDesc->mWriteStages = pRes->write_stages;
             pDesc->mIsArgumentBufferField = pRes->mIsArgumentBufferField;
             pDesc->pName = pRes->name;
             pDesc->mUpdateFrequency = updateFreq;
@@ -3988,6 +4930,19 @@ void mtl_beginCmd(Cmd* pCmd)
         pCmd->pBlitEncoder = nil;
         pCmd->pBoundPipeline = NULL;
         pCmd->mBoundIndexBuffer = nil;
+        pCmd->pResourceTracker->pIndexBuffer = NULL;
+        pCmd->pResourceTracker->mVertexBufferCount = 0;
+        pCmd->pResourceTracker->mRootResourceCount = 0;
+        pCmd->pResourceTracker->mPendingBarrierCount = 0;
+        pCmd->pResourceTracker->mFenceEpochCount = 0;
+        pCmd->pResourceTracker->mFenceCursor = 0;
+        pCmd->pResourceTracker->mBindingVersion = 0;
+        pCmd->pResourceTracker->mPassSerial = 0;
+        pCmd->pResourceTracker->mBarrierFlags = 0;
+#if defined(ENABLE_GRAPHICS_DEBUG)
+        memset(&pCmd->pResourceTracker->mDebugStats, 0, sizeof(MetalSyncDebugStats));
+#endif
+        ResetPassResourceAccesses(pCmd);
 #ifdef ENABLE_GRAPHICS_DEBUG
         pCmd->mDebugMarker[0] = '\0';
 #endif
@@ -4027,7 +4982,12 @@ void mtl_endCmd(Cmd* pCmd)
 {
     @autoreleasepool
     {
-        util_end_current_encoders(pCmd, true);
+        // A command-buffer boundary already orders work on its Metal command queue.
+        // Do not emit an orphaned coarse fence update with no possible consumer.
+        util_end_current_encoders(pCmd, false);
+#if defined(ENABLE_GRAPHICS_DEBUG)
+        FinalizeMetalSyncDebug(pCmd);
+#endif
     }
 }
 
@@ -4239,6 +5199,8 @@ void mtl_cmdBindRenderTargets(Cmd* pCmd, const BindRenderTargetsDesc* pDesc)
 
         util_end_current_encoders(pCmd, false);
         pCmd->pRenderEncoder = [pCmd->pCommandBuffer renderCommandEncoderWithDescriptor:renderPassDesc];
+        ResetPassResourceAccesses(pCmd);
+        TrackRenderPassAttachments(pCmd, pDesc);
 
 #ifdef ENABLE_GRAPHICS_DEBUG
         util_set_debug_group(pCmd);
@@ -4386,6 +5348,7 @@ void mtl_cmdBindPipeline(Cmd* pCmd, Pipeline* pPipeline)
 
                     util_end_current_encoders(pCmd, barrierRequired);
                     pCmd->pComputeEncoder = [pCmd->pCommandBuffer computeCommandEncoderWithDescriptor:computePassDescriptor];
+                    ResetPassResourceAccesses(pCmd);
 #ifdef ENABLE_GRAPHICS_DEBUG
                     util_set_debug_group(pCmd);
                     if (pCmd->mDebugMarker[0])
@@ -4422,13 +5385,23 @@ void mtl_cmdBindIndexBuffer(Cmd* pCmd, Buffer* pBuffer, uint32_t indexType, uint
     pCmd->mBoundIndexBufferOffset = (uint32_t)(offset + pBuffer->mOffset);
     pCmd->mIndexType = (INDEX_TYPE_UINT16 == indexType ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32);
     pCmd->mIndexStride = (INDEX_TYPE_UINT16 == indexType ? sizeof(uint16_t) : sizeof(uint32_t));
+    pCmd->pResourceTracker->pIndexBuffer = pBuffer;
+    MarkResourceBindingsDirty(pCmd);
 }
 
 void mtl_cmdBindVertexBuffer(Cmd* pCmd, uint32_t bufferCount, Buffer** ppBuffers, const uint32_t* pStrides, const uint64_t* pOffsets)
 {
     ASSERT(pCmd);
     ASSERT(0 != bufferCount);
+    ASSERT(bufferCount <= MAX_VERTEX_BINDINGS);
     ASSERT(ppBuffers);
+
+    pCmd->pResourceTracker->mVertexBufferCount = bufferCount;
+    for (uint32_t i = 0; i < bufferCount; ++i)
+    {
+        pCmd->pResourceTracker->ppVertexBuffers[i] = ppBuffers[i];
+    }
+    MarkResourceBindingsDirty(pCmd);
 
     // When using a poss-tessellation vertex shader, the first vertex buffer bound is used as the tessellation factors buffer.
     uint32_t startIdx = 0;
@@ -4473,6 +5446,8 @@ void mtl_cmdDraw(Cmd* pCmd, uint32_t vertexCount, uint32_t firstVertex)
     ASSERT(pCmd);
 
     RebindState(pCmd);
+    TrackBoundResourcesForCommand(pCmd, SHADER_STAGE_ALL_GRAPHICS);
+    FlushTrackedResourceBarriers(pCmd);
 
     if (!pCmd->pBoundPipeline->mTessellation)
     {
@@ -4497,6 +5472,8 @@ void mtl_cmdDrawInstanced(Cmd* pCmd, uint32_t vertexCount, uint32_t firstVertex,
     ASSERT(pCmd);
 
     RebindState(pCmd);
+    TrackBoundResourcesForCommand(pCmd, SHADER_STAGE_ALL_GRAPHICS);
+    FlushTrackedResourceBarriers(pCmd);
 
     if (!pCmd->pBoundPipeline->mTessellation)
     {
@@ -4533,6 +5510,9 @@ void mtl_cmdDrawIndexed(Cmd* pCmd, uint32_t indexCount, uint32_t firstIndex, uin
     ASSERT(pCmd);
 
     RebindState(pCmd);
+    TrackBoundResourcesForCommand(pCmd, SHADER_STAGE_ALL_GRAPHICS);
+    TrackPassResourceAccess(pCmd, pCmd->pResourceTracker->pIndexBuffer, METAL_ACCESS_STAGE_VERTEX, METAL_ACCESS_STAGE_NONE);
+    FlushTrackedResourceBarriers(pCmd);
 
     id           indexBuffer = pCmd->mBoundIndexBuffer;
     MTLIndexType indexType = (MTLIndexType)pCmd->mIndexType;
@@ -4619,6 +5599,9 @@ void mtl_cmdDrawIndexedInstanced(Cmd* pCmd, uint32_t indexCount, uint32_t firstI
     ASSERT(pCmd);
 
     RebindState(pCmd);
+    TrackBoundResourcesForCommand(pCmd, SHADER_STAGE_ALL_GRAPHICS);
+    TrackPassResourceAccess(pCmd, pCmd->pResourceTracker->pIndexBuffer, METAL_ACCESS_STAGE_VERTEX, METAL_ACCESS_STAGE_NONE);
+    FlushTrackedResourceBarriers(pCmd);
 
     id           indexBuffer = pCmd->mBoundIndexBuffer;
     MTLIndexType indexType = (MTLIndexType)pCmd->mIndexType;
@@ -4714,6 +5697,9 @@ void mtl_cmdDispatch(Cmd* pCmd, uint32_t groupCountX, uint32_t groupCountY, uint
     ASSERT(pCmd);
     ASSERT(pCmd->pComputeEncoder != nil);
 
+    TrackBoundResourcesForCommand(pCmd, SHADER_STAGE_COMP);
+    FlushTrackedResourceBarriers(pCmd);
+
     // There might have been a barrier inserted since last dispatch call
     // This only applies to dispatch since you can issue barriers inside compute pass but this is not possible inside render pass
     // For render pass, barriers are issued in cmdBindRenderTargets after beginning new encoder
@@ -4744,10 +5730,13 @@ void mtl_cmdExecuteIndirect(Cmd* pCmd, CommandSignature* pCommandSignature, uint
             {
                 util_end_current_encoders(pCmd, false);
                 pCmd->pBlitEncoder = [pCmd->pCommandBuffer blitCommandEncoder];
+                ResetPassResourceAccesses(pCmd);
                 util_set_debug_group(pCmd);
                 util_barrier_required(pCmd, QUEUE_TYPE_TRANSFER);
             }
 
+            TrackPassResourceAccess(pCmd, pIndirectBuffer, METAL_ACCESS_STAGE_NONE, METAL_ACCESS_STAGE_TRANSFER);
+            FlushTrackedResourceBarriers(pCmd);
             [pCmd->pBlitEncoder optimizeIndirectCommandBuffer:pIndirectBuffer->pIndirectCommandBuffer
                                                     withRange:NSMakeRange(rangeOffset, maxCommandCount)];
             return;
@@ -4758,15 +5747,23 @@ void mtl_cmdExecuteIndirect(Cmd* pCmd, CommandSignature* pCommandSignature, uint
             {
                 util_end_current_encoders(pCmd, false);
                 pCmd->pBlitEncoder = [pCmd->pCommandBuffer blitCommandEncoder];
+                ResetPassResourceAccesses(pCmd);
                 util_set_debug_group(pCmd);
                 util_barrier_required(pCmd, QUEUE_TYPE_TRANSFER);
             }
+            TrackPassResourceAccess(pCmd, pIndirectBuffer, METAL_ACCESS_STAGE_NONE, METAL_ACCESS_STAGE_TRANSFER);
+            FlushTrackedResourceBarriers(pCmd);
             [pCmd->pBlitEncoder resetCommandsInBuffer:pIndirectBuffer->pIndirectCommandBuffer
                                             withRange:NSMakeRange(rangeOffset, maxCommandCount)];
             return;
         }
         else if ((pIndirectBuffer->pIndirectCommandBuffer || drawType == INDIRECT_COMMAND_BUFFER) && maxCommandCount)
         {
+            TrackBoundResourcesForCommand(pCmd, SHADER_STAGE_ALL_GRAPHICS);
+            TrackPassResourceAccess(pCmd, pCmd->pResourceTracker->pIndexBuffer, METAL_ACCESS_STAGE_VERTEX,
+                                    METAL_ACCESS_STAGE_NONE);
+            TrackPassResourceAccess(pCmd, pIndirectBuffer, METAL_ACCESS_STAGE_VERTEX, METAL_ACCESS_STAGE_NONE);
+            FlushTrackedResourceBarriers(pCmd);
             [pCmd->pRenderEncoder executeCommandsInBuffer:pIndirectBuffer->pIndirectCommandBuffer
                                                 withRange:NSMakeRange(rangeOffset, maxCommandCount)];
             return;
@@ -4775,6 +5772,9 @@ void mtl_cmdExecuteIndirect(Cmd* pCmd, CommandSignature* pCommandSignature, uint
 
     if (drawType == INDIRECT_DRAW)
     {
+        TrackBoundResourcesForCommand(pCmd, SHADER_STAGE_ALL_GRAPHICS);
+        TrackPassResourceAccess(pCmd, pIndirectBuffer, METAL_ACCESS_STAGE_VERTEX, METAL_ACCESS_STAGE_NONE);
+        FlushTrackedResourceBarriers(pCmd);
         if (!pCmd->pBoundPipeline->mTessellation)
         {
             for (uint32_t i = 0; i < maxCommandCount; i++)
@@ -4801,6 +5801,11 @@ void mtl_cmdExecuteIndirect(Cmd* pCmd, CommandSignature* pCommandSignature, uint
     }
     else if (drawType == INDIRECT_DRAW_INDEX)
     {
+        TrackBoundResourcesForCommand(pCmd, SHADER_STAGE_ALL_GRAPHICS);
+        TrackPassResourceAccess(pCmd, pCmd->pResourceTracker->pIndexBuffer, METAL_ACCESS_STAGE_VERTEX,
+                                METAL_ACCESS_STAGE_NONE);
+        TrackPassResourceAccess(pCmd, pIndirectBuffer, METAL_ACCESS_STAGE_VERTEX, METAL_ACCESS_STAGE_NONE);
+        FlushTrackedResourceBarriers(pCmd);
         if (!pCmd->pBoundPipeline->mTessellation)
         {
             for (uint32_t i = 0; i < maxCommandCount; ++i)
@@ -4834,6 +5839,9 @@ void mtl_cmdExecuteIndirect(Cmd* pCmd, CommandSignature* pCommandSignature, uint
     }
     else if (drawType == INDIRECT_DISPATCH)
     {
+        TrackBoundResourcesForCommand(pCmd, SHADER_STAGE_COMP);
+        TrackPassResourceAccess(pCmd, pIndirectBuffer, METAL_ACCESS_STAGE_COMPUTE, METAL_ACCESS_STAGE_NONE);
+        FlushTrackedResourceBarriers(pCmd);
         // There might have been a barrier inserted since last dispatch call
         // This only applies to dispatch since you can issue barriers inside compute pass but this is not possible inside render pass
         // For render pass, barriers are issued in cmdBindRenderTargets after beginning new encoder
@@ -4853,18 +5861,32 @@ void mtl_cmdResourceBarrier(Cmd* pCmd, uint32_t numBufferBarriers, BufferBarrier
 {
     if (numBufferBarriers)
     {
-        pCmd->pQueue->mBarrierFlags |= BARRIER_FLAG_BUFFERS;
+        for (uint32_t i = 0; i < numBufferBarriers; ++i)
+        {
+            if (CaptureResourceBarrier(pCmd, pBufferBarriers[i].pBuffer, BARRIER_FLAG_BUFFERS))
+                pCmd->pResourceTracker->mBarrierFlags |= BARRIER_FLAG_BUFFERS;
+        }
     }
 
     if (numTextureBarriers)
     {
-        pCmd->pQueue->mBarrierFlags |= BARRIER_FLAG_TEXTURES;
+        for (uint32_t i = 0; i < numTextureBarriers; ++i)
+        {
+            if (CaptureResourceBarrier(pCmd, pTextureBarriers[i].pTexture, BARRIER_FLAG_TEXTURES))
+                pCmd->pResourceTracker->mBarrierFlags |= BARRIER_FLAG_TEXTURES;
+        }
     }
 
     if (numRtBarriers)
     {
-        pCmd->pQueue->mBarrierFlags |= BARRIER_FLAG_RENDERTARGETS;
-        pCmd->pQueue->mBarrierFlags |= BARRIER_FLAG_TEXTURES;
+        for (uint32_t i = 0; i < numRtBarriers; ++i)
+        {
+            if (CaptureResourceBarrier(pCmd, pRtBarriers[i].pRenderTarget->pTexture,
+                                       BARRIER_FLAG_RENDERTARGETS | BARRIER_FLAG_TEXTURES))
+            {
+                pCmd->pResourceTracker->mBarrierFlags |= BARRIER_FLAG_RENDERTARGETS | BARRIER_FLAG_TEXTURES;
+            }
+        }
     }
 }
 
@@ -4882,9 +5904,14 @@ void mtl_cmdUpdateBuffer(Cmd* pCmd, Buffer* pBuffer, uint64_t dstOffset, Buffer*
     {
         util_end_current_encoders(pCmd, false);
         pCmd->pBlitEncoder = [pCmd->pCommandBuffer blitCommandEncoder];
+        ResetPassResourceAccesses(pCmd);
         util_set_debug_group(pCmd);
+        util_barrier_required(pCmd, QUEUE_TYPE_TRANSFER);
     }
 
+    TrackPassResourceAccess(pCmd, pSrcBuffer, METAL_ACCESS_STAGE_TRANSFER, METAL_ACCESS_STAGE_NONE);
+    TrackPassResourceAccess(pCmd, pBuffer, METAL_ACCESS_STAGE_NONE, METAL_ACCESS_STAGE_TRANSFER);
+    FlushTrackedResourceBarriers(pCmd);
     [pCmd->pBlitEncoder copyFromBuffer:pSrcBuffer->pBuffer
                           sourceOffset:srcOffset + pSrcBuffer->mOffset
                               toBuffer:pBuffer->pBuffer
@@ -4928,9 +5955,14 @@ void mtl_cmdUpdateSubresource(Cmd* pCmd, Texture* pTexture, Buffer* pIntermediat
     {
         util_end_current_encoders(pCmd, false);
         pCmd->pBlitEncoder = [pCmd->pCommandBuffer blitCommandEncoder];
+        ResetPassResourceAccesses(pCmd);
         util_set_debug_group(pCmd);
+        util_barrier_required(pCmd, QUEUE_TYPE_TRANSFER);
     }
 
+    TrackPassResourceAccess(pCmd, pIntermediate, METAL_ACCESS_STAGE_TRANSFER, METAL_ACCESS_STAGE_NONE);
+    TrackPassResourceAccess(pCmd, pTexture, METAL_ACCESS_STAGE_NONE, METAL_ACCESS_STAGE_TRANSFER);
+    FlushTrackedResourceBarriers(pCmd);
     // Copy to the texture's final subresource.
     [pCmd->pBlitEncoder copyFromBuffer:pIntermediate->pBuffer
                           sourceOffset:pSubresourceDesc->mSrcOffset + pIntermediate->mOffset
@@ -4954,9 +5986,14 @@ void mtl_cmdCopySubresource(Cmd* pCmd, Buffer* pDstBuffer, Texture* pTexture, co
     {
         util_end_current_encoders(pCmd, false);
         pCmd->pBlitEncoder = [pCmd->pCommandBuffer blitCommandEncoder];
+        ResetPassResourceAccesses(pCmd);
         util_set_debug_group(pCmd);
+        util_barrier_required(pCmd, QUEUE_TYPE_TRANSFER);
     }
 
+    TrackPassResourceAccess(pCmd, pTexture, METAL_ACCESS_STAGE_TRANSFER, METAL_ACCESS_STAGE_NONE);
+    TrackPassResourceAccess(pCmd, pDstBuffer, METAL_ACCESS_STAGE_NONE, METAL_ACCESS_STAGE_TRANSFER);
+    FlushTrackedResourceBarriers(pCmd);
     // Copy to the texture's final subresource.
     [pCmd->pBlitEncoder copyFromTexture:pTexture->pTexture
                             sourceSlice:pSubresourceDesc->mArrayLayer
@@ -5210,8 +6247,10 @@ void mtl_cmdWriteMarker(Cmd* pCmd, const MarkerDesc* pDesc)
     {
         util_end_current_encoders(pCmd, waitForWrite);
         pCmd->pComputeEncoder = [pCmd->pCommandBuffer computeCommandEncoder];
+        ResetPassResourceAccesses(pCmd);
         util_set_debug_group(pCmd);
         util_set_heaps_compute(pCmd);
+        util_barrier_required(pCmd, QUEUE_TYPE_COMPUTE);
     }
 
     MTLSize  threadgroupCount = MTLSizeMake(1, 1, 1);
@@ -5221,6 +6260,8 @@ void mtl_cmdWriteMarker(Cmd* pCmd, const MarkerDesc* pDesc)
     [pCmd->pComputeEncoder setComputePipelineState:pCmd->pRenderer->pFillBufferPipeline];
     [pCmd->pComputeEncoder setBuffer:pDesc->pBuffer->pBuffer offset:pDesc->mOffset atIndex:0];
     [pCmd->pComputeEncoder setBytes:valueCount length:sizeof(valueCount) atIndex:1];
+    TrackPassResourceAccess(pCmd, pDesc->pBuffer, METAL_ACCESS_STAGE_NONE, METAL_ACCESS_STAGE_COMPUTE);
+    FlushTrackedResourceBarriers(pCmd);
     [pCmd->pComputeEncoder dispatchThreadgroups:threadgroupCount threadsPerThreadgroup:threadsPerGroup];
     cmdEndDebugMarker(pCmd);
 
@@ -5670,17 +6711,51 @@ MTLSamplePosition util_to_mtl_locations(SampleLocations location)
 
 void util_end_current_encoders(Cmd* pCmd, bool forceBarrier)
 {
-    const bool barrierRequired(pCmd->pQueue->mBarrierFlags);
-    UNREF_PARAM(barrierRequired);
+    const bool barrierRequired(pCmd->pResourceTracker->mBarrierFlags);
+    const MetalTrackedFenceUpdateResult trackedResult =
+        forceBarrier ? METAL_TRACKED_FENCE_NO_PRODUCER : EmitTrackedFenceUpdates(pCmd);
+    const bool trackedBarrier = trackedResult == METAL_TRACKED_FENCE_EMITTED;
+    const bool legacyBarrier = (barrierRequired && !trackedBarrier) || forceBarrier;
+#if defined(ENABLE_GRAPHICS_DEBUG)
+    MetalLegacyFenceReason legacyReason = METAL_LEGACY_FENCE_FORCED;
+    if (!forceBarrier)
+    {
+        switch (trackedResult)
+        {
+        case METAL_TRACKED_FENCE_NO_PRODUCER:
+            legacyReason = METAL_LEGACY_FENCE_NO_PRODUCER;
+            break;
+        case METAL_TRACKED_FENCE_UNKNOWN_PRODUCER_STAGE:
+            legacyReason = METAL_LEGACY_FENCE_UNKNOWN_PRODUCER_STAGE;
+            break;
+        case METAL_TRACKED_FENCE_UNSUPPORTED_PRODUCER_STAGE:
+            legacyReason = METAL_LEGACY_FENCE_UNSUPPORTED_PRODUCER_STAGE;
+            break;
+        case METAL_TRACKED_FENCE_EMITTED:
+            break;
+        }
+    }
+#endif
 
     if (pCmd->pRenderEncoder != nil)
     {
         ASSERT(pCmd->pComputeEncoder == nil && pCmd->pBlitEncoder == nil);
 
-        if (barrierRequired || forceBarrier)
+        if (legacyBarrier)
         {
-            [pCmd->pRenderEncoder updateFence:pCmd->pQueue->pQueueFence afterStages:MTLRenderStageFragment];
-            pCmd->pQueue->mBarrierFlags |= BARRIER_FLAG_FENCE;
+            [pCmd->pRenderEncoder updateFence:pCmd->pResourceTracker->pLegacyFence afterStages:MTLRenderStageFragment];
+            pCmd->pResourceTracker->mBarrierFlags |= BARRIER_FLAG_FENCE;
+#if defined(ENABLE_GRAPHICS_DEBUG)
+            ++pCmd->pResourceTracker->mDebugStats.mLegacyFenceUpdates[legacyReason];
+            pCmd->pResourceTracker->pLegacyFence.label = [NSString
+                stringWithFormat:@"RHI coarse after F (%s)",
+                                 legacyReason == METAL_LEGACY_FENCE_FORCED
+                                     ? "forced"
+                                     : legacyReason == METAL_LEGACY_FENCE_NO_PRODUCER
+                                           ? "no producer"
+                                           : legacyReason == METAL_LEGACY_FENCE_UNKNOWN_PRODUCER_STAGE ? "unknown stage"
+                                                                                                      : "unsupported stage"];
+#endif
         }
 
         [pCmd->pRenderEncoder endEncoding];
@@ -5691,10 +6766,13 @@ void util_end_current_encoders(Cmd* pCmd, bool forceBarrier)
     {
         ASSERT(pCmd->pRenderEncoder == nil && pCmd->pBlitEncoder == nil);
 
-        if (barrierRequired || forceBarrier)
+        if (legacyBarrier)
         {
-            [pCmd->pComputeEncoder updateFence:pCmd->pQueue->pQueueFence];
-            pCmd->pQueue->mBarrierFlags |= BARRIER_FLAG_FENCE;
+            [pCmd->pComputeEncoder updateFence:pCmd->pResourceTracker->pLegacyFence];
+            pCmd->pResourceTracker->mBarrierFlags |= BARRIER_FLAG_FENCE;
+#if defined(ENABLE_GRAPHICS_DEBUG)
+            ++pCmd->pResourceTracker->mDebugStats.mLegacyFenceUpdates[legacyReason];
+#endif
         }
 
         [pCmd->pComputeEncoder endEncoding];
@@ -5705,10 +6783,13 @@ void util_end_current_encoders(Cmd* pCmd, bool forceBarrier)
     {
         ASSERT(pCmd->pRenderEncoder == nil && pCmd->pComputeEncoder == nil);
 
-        if (barrierRequired || forceBarrier)
+        if (legacyBarrier)
         {
-            [pCmd->pBlitEncoder updateFence:pCmd->pQueue->pQueueFence];
-            pCmd->pQueue->mBarrierFlags |= BARRIER_FLAG_FENCE;
+            [pCmd->pBlitEncoder updateFence:pCmd->pResourceTracker->pLegacyFence];
+            pCmd->pResourceTracker->mBarrierFlags |= BARRIER_FLAG_FENCE;
+#if defined(ENABLE_GRAPHICS_DEBUG)
+            ++pCmd->pResourceTracker->mDebugStats.mLegacyFenceUpdates[legacyReason];
+#endif
         }
 
         [pCmd->pBlitEncoder endEncoding];
@@ -5722,10 +6803,10 @@ void util_end_current_encoders(Cmd* pCmd, bool forceBarrier)
         {
             ASSERT(pCmd->pRenderEncoder == nil && pCmd->pComputeEncoder == nil && pCmd->pBlitEncoder == nil);
 
-            if (barrierRequired || forceBarrier)
+            if (legacyBarrier)
             {
-                [pCmd->pASEncoder updateFence:pCmd->pQueue->pQueueFence];
-                pCmd->pQueue->mBarrierFlags |= BARRIER_FLAG_FENCE;
+                [pCmd->pASEncoder updateFence:pCmd->pResourceTracker->pLegacyFence];
+                pCmd->pResourceTracker->mBarrierFlags |= BARRIER_FLAG_FENCE;
             }
 
             [pCmd->pASEncoder endEncoding];
@@ -5733,21 +6814,26 @@ void util_end_current_encoders(Cmd* pCmd, bool forceBarrier)
         }
     }
 #endif
+
+    if (trackedBarrier)
+    {
+        pCmd->pResourceTracker->mBarrierFlags = 0;
+    }
 }
 
 void util_barrier_required(Cmd* pCmd, const QueueType& encoderType)
 {
-    if (pCmd->pQueue->mBarrierFlags)
+    if (pCmd->pResourceTracker->mBarrierFlags)
     {
         bool issuedWait = false;
-        if (pCmd->pQueue->mBarrierFlags & BARRIER_FLAG_FENCE)
+        if (pCmd->pResourceTracker->mBarrierFlags & BARRIER_FLAG_FENCE)
         {
 #if defined(MTL_RAYTRACING_AVAILABLE)
             if (MTL_RAYTRACING_SUPPORTED)
             {
                 if (pCmd->pASEncoder != nil)
                 {
-                    [pCmd->pASEncoder waitForFence:pCmd->pQueue->pQueueFence];
+                    [pCmd->pASEncoder waitForFence:pCmd->pResourceTracker->pLegacyFence];
                     issuedWait = true;
                 }
             }
@@ -5757,13 +6843,22 @@ void util_barrier_required(Cmd* pCmd, const QueueType& encoderType)
                 switch (encoderType)
                 {
                 case QUEUE_TYPE_GRAPHICS:
-                    [pCmd->pRenderEncoder waitForFence:pCmd->pQueue->pQueueFence beforeStages:MTLRenderStageVertex];
+                    [pCmd->pRenderEncoder waitForFence:pCmd->pResourceTracker->pLegacyFence beforeStages:MTLRenderStageVertex];
+#if defined(ENABLE_GRAPHICS_DEBUG)
+                    ++pCmd->pResourceTracker->mDebugStats.mLegacyFenceWaits[0];
+#endif
                     break;
                 case QUEUE_TYPE_COMPUTE:
-                    [pCmd->pComputeEncoder waitForFence:pCmd->pQueue->pQueueFence];
+                    [pCmd->pComputeEncoder waitForFence:pCmd->pResourceTracker->pLegacyFence];
+#if defined(ENABLE_GRAPHICS_DEBUG)
+                    ++pCmd->pResourceTracker->mDebugStats.mLegacyFenceWaits[2];
+#endif
                     break;
                 case QUEUE_TYPE_TRANSFER:
-                    [pCmd->pBlitEncoder waitForFence:pCmd->pQueue->pQueueFence];
+                    [pCmd->pBlitEncoder waitForFence:pCmd->pResourceTracker->pLegacyFence];
+#if defined(ENABLE_GRAPHICS_DEBUG)
+                    ++pCmd->pResourceTracker->mDebugStats.mLegacyFenceWaits[3];
+#endif
                     break;
                 default:
                     ASSERT(false);
@@ -5777,21 +6872,21 @@ void util_barrier_required(Cmd* pCmd, const QueueType& encoderType)
             case QUEUE_TYPE_GRAPHICS:
             {
 #if defined(ENABLE_MEMORY_BARRIERS_GRAPHICS)
-                if (pCmd->pQueue->mBarrierFlags & BARRIER_FLAG_BUFFERS)
+                if (pCmd->pResourceTracker->mBarrierFlags & BARRIER_FLAG_BUFFERS)
                 {
                     [pCmd->pRenderEncoder memoryBarrierWithScope:MTLBarrierScopeBuffers
                                                      afterStages:MTLRenderStageFragment
                                                     beforeStages:MTLRenderStageVertex];
                 }
 
-                if (pCmd->pQueue->mBarrierFlags & BARRIER_FLAG_TEXTURES)
+                if (pCmd->pResourceTracker->mBarrierFlags & BARRIER_FLAG_TEXTURES)
                 {
                     [pCmd->pRenderEncoder memoryBarrierWithScope:MTLBarrierScopeTextures
                                                      afterStages:MTLRenderStageFragment
                                                     beforeStages:MTLRenderStageVertex];
                 }
 
-                if (pCmd->pQueue->mBarrierFlags & BARRIER_FLAG_RENDERTARGETS)
+                if (pCmd->pResourceTracker->mBarrierFlags & BARRIER_FLAG_RENDERTARGETS)
                 {
                     [pCmd->pRenderEncoder memoryBarrierWithScope:MTLBarrierScopeRenderTargets
                                                      afterStages:MTLRenderStageFragment
@@ -5803,12 +6898,12 @@ void util_barrier_required(Cmd* pCmd, const QueueType& encoderType)
 
             case QUEUE_TYPE_COMPUTE:
             {
-                if (pCmd->pQueue->mBarrierFlags & BARRIER_FLAG_BUFFERS)
+                if (pCmd->pResourceTracker->mBarrierFlags & BARRIER_FLAG_BUFFERS)
                 {
                     [pCmd->pComputeEncoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
                 }
 
-                if (pCmd->pQueue->mBarrierFlags & BARRIER_FLAG_TEXTURES)
+                if (pCmd->pResourceTracker->mBarrierFlags & BARRIER_FLAG_TEXTURES)
                 {
                     [pCmd->pComputeEncoder memoryBarrierWithScope:MTLBarrierScopeTextures];
                 }
@@ -5817,9 +6912,9 @@ void util_barrier_required(Cmd* pCmd, const QueueType& encoderType)
 
             case QUEUE_TYPE_TRANSFER:
                 // we cant use barriers with blit encoder, only fence if available
-                if (pCmd->pQueue->mBarrierFlags & BARRIER_FLAG_FENCE)
+                if (pCmd->pResourceTracker->mBarrierFlags & BARRIER_FLAG_FENCE)
                 {
-                    [pCmd->pBlitEncoder waitForFence:pCmd->pQueue->pQueueFence];
+                    [pCmd->pBlitEncoder waitForFence:pCmd->pResourceTracker->pLegacyFence];
                 }
                 break;
 
@@ -5828,7 +6923,7 @@ void util_barrier_required(Cmd* pCmd, const QueueType& encoderType)
             }
         }
 
-        pCmd->pQueue->mBarrierFlags = 0;
+        pCmd->pResourceTracker->mBarrierFlags = 0;
     }
 }
 

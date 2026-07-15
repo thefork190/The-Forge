@@ -99,6 +99,11 @@ struct ShaderResource
 #if defined(METAL)
     uint32_t           alignment;
     bool               mIsArgumentBufferField;
+    // Keep read and write visibility separate. A combined used_stages mask is
+    // insufficient for selecting narrow Metal fence frontiers when the same
+    // binding is read in one stage and written in another.
+    ShaderStage        read_stages;
+    ShaderStage        write_stages;
     ArgumentDescriptor mArgumentDescriptor;
 #endif
 };

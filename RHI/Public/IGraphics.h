@@ -1414,6 +1414,8 @@ typedef struct DEFINE_ALIGNED(DescriptorInfo, 16)
         {
             id<MTLSamplerState> pStaticSampler;
             uint32_t            mUsedStages : 6;
+            uint32_t            mReadStages : 6;
+            uint32_t            mWriteStages : 6;
             uint32_t            mReg : 10;
             uint32_t            mIsArgumentBufferField : 1;
             MTLResourceUsage    mUsage;
@@ -1799,6 +1801,9 @@ typedef struct DEFINE_ALIGNED(Cmd, 64)
             const RootSignature* pUsedRootSignature;
             DescriptorSet*       mBoundDescriptorSets[DESCRIPTOR_UPDATE_FREQ_COUNT];
             uint32_t             mBoundDescriptorSetIndices[DESCRIPTOR_UPDATE_FREQ_COUNT];
+            // Metal-only command recording state used to derive stage-scoped
+            // resource hazards without exposing the tracker implementation.
+            struct MetalResourceTracker* pResourceTracker;
 #ifdef ENABLE_DRAW_INDEX_BASE_VERTEX_FALLBACK
             // When first vertex is not supported for indexed draw, we have to offset the
             // vertex buffer manually using setVertexBufferOffset
@@ -1969,8 +1974,6 @@ typedef struct Queue
         struct
         {
             id<MTLCommandQueue> pCommandQueue;
-            id<MTLFence>        pQueueFence;
-            uint32_t            mBarrierFlags;
         };
 #endif
 #if defined(ORBIS)

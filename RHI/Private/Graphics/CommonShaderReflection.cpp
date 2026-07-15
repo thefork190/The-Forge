@@ -130,6 +130,10 @@ void createPipelineReflection(ShaderReflection* pReflection, uint32_t stageCount
 
     ShaderResource** pUniqueResources = NULL;
     ShaderStage*     pShaderUsage = NULL;
+#if defined(METAL)
+    ShaderStage* pShaderReadUsage = NULL;
+    ShaderStage* pShaderWriteUsage = NULL;
+#endif
     ShaderVariable** pUniqueVariable = NULL;
     ShaderResource** pUniqueVariableParent = NULL;
     for (uint32_t i = 0; i < stageCount; ++i)
@@ -182,6 +186,10 @@ void createPipelineReflection(ShaderReflection* pReflection, uint32_t stageCount
                     if (arrlen(pShaderUsage) > k)
                     {
                         pShaderUsage[k] |= pSrcRef->pShaderResources[j].used_stages;
+#if defined(METAL)
+                        pShaderReadUsage[k] |= pSrcRef->pShaderResources[j].read_stages;
+                        pShaderWriteUsage[k] |= pSrcRef->pShaderResources[j].write_stages;
+#endif
                         break;
                     }
                 }
@@ -191,6 +199,10 @@ void createPipelineReflection(ShaderReflection* pReflection, uint32_t stageCount
             if (unique == true)
             {
                 arrpush(pShaderUsage, pSrcRef->pShaderResources[j].used_stages);
+#if defined(METAL)
+                arrpush(pShaderReadUsage, pSrcRef->pShaderResources[j].read_stages);
+                arrpush(pShaderWriteUsage, pSrcRef->pShaderResources[j].write_stages);
+#endif
                 arrpush(pUniqueResources, &pSrcRef->pShaderResources[j]);
             }
         }
@@ -227,6 +239,10 @@ void createPipelineReflection(ShaderReflection* pReflection, uint32_t stageCount
         {
             pResources[i] = *pUniqueResources[i];
             pResources[i].used_stages = pShaderUsage[i];
+#if defined(METAL)
+            pResources[i].read_stages = pShaderReadUsage[i];
+            pResources[i].write_stages = pShaderWriteUsage[i];
+#endif
         }
     }
 
@@ -270,6 +286,10 @@ void createPipelineReflection(ShaderReflection* pReflection, uint32_t stageCount
 
     arrfree(pUniqueResources);
     arrfree(pShaderUsage);
+#if defined(METAL)
+    arrfree(pShaderReadUsage);
+    arrfree(pShaderWriteUsage);
+#endif
     arrfree(pUniqueVariable);
     arrfree(pUniqueVariableParent);
 }
