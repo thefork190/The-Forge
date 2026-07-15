@@ -58,6 +58,7 @@ struct BufferInfo
     size_t sizeInBytes = 0;
     size_t alignment = 0;
     int    currentOffset = 0;
+    MTL_ACCESS_TYPE access = MTL_ACCESS_ENUM(ReadOnly);
     bool   isUAV = false;
     bool   isArgBuffer = false;
     bool   isAccelerationStructure = false;
@@ -73,6 +74,7 @@ struct TextureInfo
 {
     char           name[MAX_REFLECT_STRING_LENGTH];
     MTLTextureType type;
+    MTL_ACCESS_TYPE access;
     int            slotIndex;
     bool           isUAV;
     int            arrayLength;
@@ -366,6 +368,14 @@ static void reflectShader(ShaderReflectionInfo* info, NSArray<MTLArgument*>* sha
         for (uint32_t argIndex = 0; argIndex < [shaderBindings count]; ++argIndex)
         {
             id<MTLBinding> binding = shaderBindings[argIndex];
+            // Pipeline reflection can retain bindings from the function signature that the
+            // compiled shader never references.  Do not turn those into RHI dependencies.
+            // This is the driver's post-compilation answer and is therefore more reliable
+            // than inferring usage from generated shader source or naming conventions.
+            if (!binding.used)
+            {
+                continue;
+            }
             if (binding.type == MTLBindingTypeBuffer)
             {
                 id<MTLBufferBinding> binding = shaderBindings[argIndex];
@@ -392,6 +402,7 @@ static void reflectShader(ShaderReflectionInfo* info, NSArray<MTLArgument*>* sha
                 bufferInfo.bufferIndex = (uint32_t)binding.index;
                 bufferInfo.sizeInBytes = binding.bufferDataSize;
                 bufferInfo.alignment = binding.bufferAlignment;
+                bufferInfo.access = binding.access;
                 bufferInfo.isUAV = (binding.access == MTL_ACCESS_ENUM(ReadWrite) || binding.access == MTL_ACCESS_ENUM(WriteOnly));
                 bufferInfo.isArgBuffer = binding.bufferPointerType.elementIsArgumentBuffer;
 
@@ -411,6 +422,7 @@ static void reflectShader(ShaderReflectionInfo* info, NSArray<MTLArgument*>* sha
                 strlcpy(textureInfo.name, [binding.name UTF8String], MAX_REFLECT_STRING_LENGTH);
                 textureInfo.slotIndex = (uint32_t)binding.index;
                 textureInfo.type = binding.textureType;
+                textureInfo.access = binding.access;
                 textureInfo.isUAV = (binding.access == MTL_ACCESS_ENUM(ReadWrite) || binding.access == MTL_ACCESS_ENUM(WriteOnly));
                 textureInfo.arrayLength = (int)binding.arrayLength;
                 arrpush(info->textures, textureInfo);
@@ -423,6 +435,7 @@ static void reflectShader(ShaderReflectionInfo* info, NSArray<MTLArgument*>* sha
                 bufferInfo.bufferIndex = (uint32_t)binding.index;
                 bufferInfo.sizeInBytes = 0;
                 bufferInfo.alignment = 0;
+                bufferInfo.access = binding.access;
                 bufferInfo.isUAV = (binding.access == MTL_ACCESS_ENUM(ReadWrite) || binding.access == MTL_ACCESS_ENUM(WriteOnly));
                 bufferInfo.isAccelerationStructure = true;
                 arrpush(info->buffers, bufferInfo);
@@ -435,6 +448,12 @@ static void reflectShader(ShaderReflectionInfo* info, NSArray<MTLArgument*>* sha
         for (uint32_t argIndex = 0; argIndex < [shaderArgs count]; ++argIndex)
         {
             MTLArgument* arg = shaderArgs[argIndex];
+            // Legacy reflection exposes the same post-compilation information as
+            // MTLBinding.used through MTLArgument.active.
+            if (!arg.active)
+            {
+                continue;
+            }
             if (arg.type == MTLArgumentTypeBuffer)
             {
                 if (arg.bufferDataType == MTLDataTypeStruct)
@@ -460,6 +479,7 @@ static void reflectShader(ShaderReflectionInfo* info, NSArray<MTLArgument*>* sha
                 bufferInfo.bufferIndex = (uint32_t)arg.index;
                 bufferInfo.sizeInBytes = arg.bufferDataSize;
                 bufferInfo.alignment = arg.bufferAlignment;
+                bufferInfo.access = arg.access;
                 bufferInfo.isUAV = (arg.access == MTL_ACCESS_ENUM(ReadWrite) || arg.access == MTL_ACCESS_ENUM(WriteOnly));
                 bufferInfo.isArgBuffer = arg.bufferPointerType.elementIsArgumentBuffer;
 
@@ -478,6 +498,7 @@ static void reflectShader(ShaderReflectionInfo* info, NSArray<MTLArgument*>* sha
                 strlcpy(textureInfo.name, [arg.name UTF8String], MAX_REFLECT_STRING_LENGTH);
                 textureInfo.slotIndex = (uint32_t)arg.index;
                 textureInfo.type = arg.textureType;
+                textureInfo.access = arg.access;
                 textureInfo.isUAV = (arg.access == MTL_ACCESS_ENUM(ReadWrite) || arg.access == MTL_ACCESS_ENUM(WriteOnly));
                 textureInfo.arrayLength = (int)arg.arrayLength;
                 arrpush(info->textures, textureInfo);
@@ -531,7 +552,7 @@ static uint32_t calculateNamePoolSize(const ShaderReflectionInfo* shaderReflecti
 }
 
 void addShaderResource(ShaderResource* pResources, uint32_t idx, DescriptorType type, uint32_t bindingPoint, size_t sizeInBytes,
-                       size_t alignment, ShaderStage shaderStage, char** ppCurrentName, char* name)
+                       size_t alignment, MTL_ACCESS_TYPE access, ShaderStage shaderStage, char** ppCurrentName, char* name)
 {
     uint32_t set = DESCRIPTOR_UPDATE_FREQ_NONE + 10;
     if (0 == strncmp(name, "_fsl", 4))
@@ -555,6 +576,14 @@ void addShaderResource(ShaderResource* pResources, uint32_t idx, DescriptorType 
     pResources[idx].size = (uint32_t)sizeInBytes;
     pResources[idx].alignment = (uint32_t)alignment;
     pResources[idx].used_stages = shaderStage;
+    if (access == MTL_ACCESS_ENUM(ReadOnly) || access == MTL_ACCESS_ENUM(ReadWrite))
+    {
+        pResources[idx].read_stages = shaderStage;
+    }
+    if (access == MTL_ACCESS_ENUM(WriteOnly) || access == MTL_ACCESS_ENUM(ReadWrite))
+    {
+        pResources[idx].write_stages = shaderStage;
+    }
     pResources[idx].name = *ppCurrentName;
     pResources[idx].name_size = (uint32_t)strlen(name);
     // we dont own the names memory we need to copy it to the name pool
@@ -822,7 +851,7 @@ void mtl_createShaderReflection(Renderer* pRenderer, Shader* shader, ShaderStage
                 {
                     // argument buffer info
                     addShaderResource(pResources, resourceIdx, DESCRIPTOR_TYPE_UNDEFINED, bufferInfo.bufferIndex, bufferInfo.sizeInBytes,
-                                      bufferInfo.alignment, shaderStage, &pCurrentName, (char*)bufferInfo.name);
+                                      bufferInfo.alignment, bufferInfo.access, shaderStage, &pCurrentName, (char*)bufferInfo.name);
 
                     resourceIdxByBufferIdx[bufferInfo.bufferIndex] = resourceIdx++;
 
@@ -869,7 +898,7 @@ void mtl_createShaderReflection(Renderer* pRenderer, Shader* shader, ShaderStage
                             }
 
                             addShaderResource(pResources, resourceIdx, descriptorType, bufferInfo.bufferIndex, bufferMember.sizeInBytes, 0,
-                                              shaderStage, &pCurrentName, (char*)bufferMember.name);
+                                              bufferMember.descriptor.mAccessType, shaderStage, &pCurrentName, (char*)bufferMember.name);
 
                             pResources[resourceIdx].mIsArgumentBufferField = true;
                             pResources[resourceIdx].mArgumentDescriptor = bufferMember.descriptor;
@@ -886,7 +915,7 @@ void mtl_createShaderReflection(Renderer* pRenderer, Shader* shader, ShaderStage
                     descriptorType = bufferInfo.isAccelerationStructure ? DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE : descriptorType;
 
                     addShaderResource(pResources, resourceIdx, descriptorType, bufferInfo.bufferIndex, bufferInfo.sizeInBytes,
-                                      bufferInfo.alignment, shaderStage, &pCurrentName, (char*)bufferInfo.name);
+                                      bufferInfo.alignment, bufferInfo.access, shaderStage, &pCurrentName, (char*)bufferInfo.name);
 
                     pResources[resourceIdx].mIsArgumentBufferField = false;
                     // pResources[resourceIdx].pArgumentBufferType = RESOURCE_STATE_UNDEFINED;
@@ -901,7 +930,7 @@ void mtl_createShaderReflection(Renderer* pRenderer, Shader* shader, ShaderStage
         {
             const TextureInfo& texInfo = reflectionInfo.textures[i];
             addShaderResource(pResources, resourceIdx, texInfo.isUAV ? DESCRIPTOR_TYPE_RW_TEXTURE : DESCRIPTOR_TYPE_TEXTURE,
-                              texInfo.slotIndex, texInfo.arrayLength, 0, shaderStage, &pCurrentName, (char*)texInfo.name);
+                              texInfo.slotIndex, texInfo.arrayLength, 0, texInfo.access, shaderStage, &pCurrentName, (char*)texInfo.name);
 
             pResources[resourceIdx].dim = getTextureDimFromType(texInfo.type);
             pResources[resourceIdx].mIsArgumentBufferField = false;
@@ -911,7 +940,7 @@ void mtl_createShaderReflection(Renderer* pRenderer, Shader* shader, ShaderStage
         {
             const SamplerInfo& samplerInfo = reflectionInfo.samplers[i];
             addShaderResource(pResources, resourceIdx, DESCRIPTOR_TYPE_SAMPLER, samplerInfo.slotIndex, 0 /*samplerInfo.sizeInBytes*/, 0,
-                              shaderStage, &pCurrentName, (char*)samplerInfo.name);
+                              MTL_ACCESS_ENUM(ReadOnly), shaderStage, &pCurrentName, (char*)samplerInfo.name);
             // pResources[resourceIdx].pArgumentBufferType = RESOURCE_STATE_UNDEFINED;
             pResources[resourceIdx].mIsArgumentBufferField = false;
         }
